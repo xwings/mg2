@@ -1,6 +1,6 @@
-# mg2 — a browser engine for the 1996 DOS game
+# 魔神战记2(mg2) — a browser engine for the 1996 DOS game
 
-A native HTML5 Canvas port of **MG2** (Dec 1996), a Traditional Chinese
+A native HTML5 Canvas port of **魔神战记2** (Dec 1996), a Traditional Chinese
 DOS 6.22 RPG. No DOSBox. The engine opens the original binary game files
 directly in the browser at load time and runs the game as the
 reverse-engineered EXE + ATT.LOD + SJN.DAT + friends would on real
