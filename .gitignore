@@ -1,0 +1,30 @@
+# Original 1996 DOS game files — NOT part of this project, provide your own copy.
+# (See LICENSE for why these are excluded.)
+mg2/
+mg2.jsdos
+disasm/
+
+# Research/dump outputs from mg2tools.py
+dump/
+
+# Local screenshots, notes, scratch work
+tmp/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / OS junk
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude / agent caches (if any land in-tree)
+.claude/

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>MG2 - Engine vs DOSBox</title>
+<link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#111;color:#0f0;font-family:monospace;overflow:hidden}
+.container{display:flex;width:100vw;height:100vh}
+.pane{flex:1;display:flex;flex-direction:column;border-right:2px solid #333}
+.pane:last-child{border-right:none}
+.title{background:#222;padding:8px;text-align:center;font-weight:bold}
+.game{flex:1;position:relative;background:#000}
+iframe{width:100%;height:100%;border:none}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="pane">
+    <div class="title">ORIGINAL (DOSBox via js-dos)</div>
+    <div class="game" id="dosbox"></div>
+  </div>
+  <div class="pane">
+    <div class="title">WEB ENGINE</div>
+    <div class="game"><iframe src="index.html" id="web"></iframe></div>
+  </div>
+</div>
+<script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+<script>
+Dos(document.getElementById("dosbox"), {
+    url: "mg2.jsdos",
+    autoStart: true,
+    theme: "dark",
+    renderAspect: "4/3",
+    imageRendering: "pixelated",
+    noNetworking: true,
+    noCloud: true,
+    noMenu: false,
+});
+</script>
+</body>
+</html>
