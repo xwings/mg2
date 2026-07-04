@@ -313,7 +313,12 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
       const a = enemies[i];
       const aSpr = enemyFrames && enemyFrames[a.sprite];
       const aW = aSpr?.w ?? 80, aH = aSpr?.h ?? 70;
-      for(let j = 0; j < i; j++){
+      // Nudging is vertical-only inside a ~13-tile clamp band, so a pair of
+      // tall sprites can overlap at every reachable Y. Cap the retries and
+      // accept the residual overlap (the original game overlaps formations
+      // too) — an uncapped rescan oscillates at the maxY clamp forever.
+      let tries = 0;
+      for(let j = 0; j < i && tries < 60; j++){
         const b = enemies[j];
         const bSpr = enemyFrames && enemyFrames[b.sprite];
         const bW = bSpr?.w ?? 80, bH = bSpr?.h ?? 70;
@@ -324,6 +329,7 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
           const maxY = Math.min(153, state.pY + 4);
           if(a.mapY < maxY) a.mapY += 2;
           else a.mapY = Math.max(1, a.mapY - 2);
+          tries++;
           j = -1;
         }
       }

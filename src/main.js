@@ -606,7 +606,12 @@ async function boot(){
               state.state = ST.PLAY;
               const ok = await runScript('TS001', 1, '', 0);
               if(!ok) await runScript('TS001', 0, '', 0);
-            })();
+            })().catch(e => {
+              // ST.TRANS has no input exit — a rejection here would
+              // soft-lock on a black screen, so fall back to the title.
+              console.error('new game', e);
+              state.state = ST.TITLE;
+            });
           }
         }
       } else if(state.state === ST.PLAY){
@@ -626,7 +631,11 @@ async function boot(){
             const trig = checkTrigger(state, areas);
             if(trig && !pendingTrigger){
               pendingTrigger = trig;
-              handleTransition(trig).then(() => { pendingTrigger = null; });
+              handleTransition(trig).then(() => { pendingTrigger = null; }).catch(e => {
+                // ST.TRANS has no input exit — recover instead of soft-locking.
+                console.error('transition', e);
+                pendingTrigger = null; transitionMsg = ''; state.state = ST.PLAY;
+              });
             } else {
               const sTrig = checkScriptTrigger(state, areas, firedScripts);
               if(sTrig){
@@ -634,7 +643,11 @@ async function boot(){
                 // dispatcher may rewrite flags (FF20) or skip entirely when
                 // the quest flag is set. Re-entering the tile after a state
                 // change should re-dispatch.
-                fireScriptTrigger(sTrig);
+                fireScriptTrigger(sTrig).catch(e => {
+                  // ST.TRANS has no input exit — recover instead of soft-locking.
+                  console.error('script trigger', e);
+                  if(state.state === ST.TRANS) state.state = ST.PLAY;
+                });
               } else {
                 battle.tryEncounter();
               }
@@ -653,12 +666,20 @@ async function boot(){
           } else {
             const sTrig = getFacingScriptTrigger();
             if(sTrig){
-              fireScriptTrigger(sTrig);
+              fireScriptTrigger(sTrig).catch(e => {
+                // ST.TRANS has no input exit — recover instead of soft-locking.
+                console.error('script trigger', e);
+                if(state.state === ST.TRANS) state.state = ST.PLAY;
+              });
             } else {
               const trig = getFacingTrigger();
               if(trig && !pendingTrigger){
                 pendingTrigger = trig;
-                handleTransition(trig).then(() => { pendingTrigger = null; });
+                handleTransition(trig).then(() => { pendingTrigger = null; }).catch(e => {
+                  // ST.TRANS has no input exit — recover instead of soft-locking.
+                  console.error('transition', e);
+                  pendingTrigger = null; transitionMsg = ''; state.state = ST.PLAY;
+                });
               } else {
                 tryPickupTreasure().catch(e => console.error('pickup', e));
               }
@@ -1034,12 +1055,31 @@ async function boot(){
           return;
         }
         state.state = ST.TRANS;
-        const ok = await doLoad(index);
+        let ok = false;
+        try{ ok = await doLoad(index); }
+        catch(e){
+          // ST.TRANS has no input exit — a corrupt/imported save that
+          // rejects mid-load must land back on the picker's caller.
+          console.error('load', e);
+        }
         state.state = ok ? ST.PLAY : returnTo;
       }
     }
 
+    let lastTickErr = '';
     function tick(now){
+      try{
+        tickFrame(now);
+      }catch(e){
+        // A data-dependent throw must cost one frame, not the whole game:
+        // rescheduling lives outside the try so the RAF chain survives.
+        // Dedup so a persistent error doesn't flood the console.
+        if(String(e) !== lastTickErr){ lastTickErr = String(e); console.error('tick', e); }
+      }
+      requestAnimationFrame(tick);
+    }
+
+    function tickFrame(now){
       let dt = now - last; last = now;
       if(dt > 200) dt = 200;
       acc += dt;
@@ -1118,7 +1158,6 @@ async function boot(){
       }
 
       disp.getContext('2d').drawImage(offC, 0, 0, disp.width, disp.height);
-      requestAnimationFrame(tick);
     }
 
     requestAnimationFrame(tick);
