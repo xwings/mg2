@@ -26,8 +26,8 @@ screen is explicitly out of scope). Persistence primitives live in
 - `src/save.js:68` - `exportSlotToFile(slot)` - browser download of the raw blob.
 - `src/save.js:89` - `importFileToSlot(slot)` - file-picker import with shape validation.
 - `src/save.js:123` - `SAVE_SLOTS = 5`.
-- `src/main.js:838` - `snapshotState()` - party, inventory, flags, NPC deltas, collected treasures, position.
-- `src/main.js:924` - `doLoad(slot)` - the load-order contract: reset NPCs to `_orig*` → restore flags → load map → `applySJN` → overlay saved NPC deltas. Reordering this corrupts quest-blocker state.
+- `src/main.js` - `snapshotState()` - party, inventory, flags, NPC deltas, collected treasures, position. Party members persist `base` stats + `equipment` item ids (the durable truth); effective stats and item-name glyphs are recomputed/re-resolved on load. Inventory entries persist as `{id, count}` only.
+- `src/main.js` - `doLoad(slot)` - the load-order contract: reset NPCs to `_orig*` → restore flags → load map → `applySJN` → overlay saved NPC deltas. Reordering this corrupts quest-blocker state. Member hydration runs `recomputeStats` (base + item table). Legacy saves (flat stats, object equipment with pre-decode shop ids) load with their stats as base and equipment dropped — the old ids don't map to the real item table.
 
 ## Interactions
 

@@ -34,10 +34,12 @@ shops/inns, equipment, saves, quest-flag-driven NPC blockers.
 - Served from a static HTTP server at the repo root
   (`python3 -m http.server 8080` → `http://localhost:8080/`).
 - Requires a legally-obtained copy of the original game data under
-  `mg2/` (gitignored): `mg2/ATT.LOD`, `mg2/D/` (palette, sprites,
-  glyph tables, tilesets, PBMs), `mg2/S/` (area/NPC/treasure/quest
-  tables + 60 `.15T` scripts), `mg2/M/` (56 `.MAP` files). The engine
-  `fetch()`es these at boot and fails loudly if they are missing.
+  `mg2/` (gitignored): `mg2/MG2.EXE` (item table + new-game state are
+  parsed out of the executable at boot), `mg2/ATT.LOD`, `mg2/D/`
+  (palette, sprites, glyph tables, tilesets, PBMs), `mg2/S/`
+  (area/NPC/treasure/quest tables + 60 `.15T` scripts), `mg2/M/`
+  (56 `.MAP` files). The engine `fetch()`es these at boot and fails
+  loudly if they are missing.
 - Research tooling (`mg2tools.py`) is stdlib-only Python 3; only the
   `disasm*` subcommands need `pip install capstone`.
 
@@ -46,7 +48,7 @@ shops/inns, equipment, saves, quest-flag-driven NPC blockers.
 ```
 index.html       → boot shell; loads src/main.js as an ES module
 compare.html     → A/B harness: DOSBox (js-dos) original vs this engine
-src/             → 14 ES modules (see Index for the module docs)
+src/             → 17 ES modules (see Index for the module docs)
 mg2tools.py      → Python research/verification CLI for every format
 power_saved.json → importable debug save (level-1 hero, 999 everything)
 mg2/             → original game data (gitignored, user-provided)
@@ -75,10 +77,22 @@ Details, exact load order, and per-state dispatch:
   against exceptions killing the loop, added recovery to async
   `ST.TRANS` transitions. See [battle.md](ARCHITECTURE/battle.md) and
   [boot-loop.md](ARCHITECTURE/boot-loop.md).
-- **M3 — Remaining decodes (open).** `.15T` opcodes FF80/FFB0/FFD0;
-  the original shop opcode (shop stock tables are hand-authored until
-  then); SJN `rawTiles` map-tile rewrites; EXP-threshold double-roll
-  fix in level-up. Tracked in each module's Open Gaps section.
+- **M3 — Remaining decodes (done, 2026-07).** Decoded the real item
+  system out of MG2.EXE and replaced every hand-authored stand-in:
+  item table (stats/equip-mask/price) at file 0xDAE3, six-slot equip
+  with recompute semantics, script-opcode shops (FF01 inn / FF02 item
+  / FF03 equip with inline stock), FF80 tile stamps (+ SJN `rawTiles`),
+  FFB0 cutscene images, FFD0 quest-item removal, FF50/FF55 party size,
+  FFF0 full heal, P.15-only item names, EXP-threshold double-roll fix,
+  new-game state parsed from the EXE. See [menu.md](ARCHITECTURE/menu.md),
+  [shop.md](ARCHITECTURE/shop.md),
+  [script-interpreter.md](ARCHITECTURE/script-interpreter.md).
+- **M4 — Fidelity gaps (open).** Companion party members (initial data
+  for members 1-3 already parsed; FF50/FF55 recorded but solo-only
+  play); the real spell system (ids + MP-cost table at DS:0x4bf are
+  known, effects live in ATT.LOD); status conditions / cure items
+  (ids 4, 6, 13-18); battle-UI parity with ATT.LOD. Tracked in each
+  module's Open Gaps section.
 
 ## Key MG2.EXE Variables
 
@@ -95,10 +109,16 @@ Details, exact load order, and per-state dispatch:
 | `cs:0xb1ed` | Encounter enemy id (written, not read by ATT.LOD) |
 
 MG2.EXE ↔ ATT.LOD handoff goes through `S/BACK.DAT`: MG2.EXE writes
-`cs:[0xb174..0xb24a]` (214 bytes) + `cs:[0x0004..0x04be]` (1210 bytes)
+`cs:[0xb174..0xb24a]` (214 bytes) + `DS:[0x0004..0x04be]` (1210 bytes)
 to the file, ATT.LOD reads back into `cs:[0xbe2f..0xbf05]` +
-`DS:[0..0x4ba]`. Address delta is `0xCBB`, e.g. MG2 `cs:[0xb1eb]` →
-ATT.LOD `cs:[0xbea6]`.
+`DS:[0..0x4ba]`. Address delta is `0xCBB` for the cs block (e.g. MG2
+`cs:[0xb1eb]` → ATT.LOD `cs:[0xbea6]`) and `−4` for the DS block.
+MG2.EXE's DS = `cs:[0x64]` = paragraph 0xD23; DS:0 sits at file offset
+0xD430. Key DS structures: party records at DS:0x0004 (4 × 0xA0 bytes,
+stats/equipment layout in [menu.md](ARCHITECTURE/menu.md)), inventory
+at DS:0x284 (82 × {u16 id, u16 count}), script flags at DS:0x3D8, item
+table at DS:0x6B3 (410 × 20 bytes, file 0xDAE3), spell MP costs at
+DS:0x4bf.
 
 ## Debug URL Parameters
 
@@ -248,5 +268,5 @@ before implementation rather than after mistakes.
 - [shop.md](ARCHITECTURE/shop.md) — shops and inns (hand-authored stock tables)
 - [menu.md](ARCHITECTURE/menu.md) — ESC-menu actions: use item, cast spell, equip
 - [save.md](ARCHITECTURE/save.md) — 5-slot localStorage saves, export/import, restore order
-- [render.md](ARCHITECTURE/render.md) — scene/sprite/HUD/dialog/menu drawing, .HEI passes
+- [render.md](ARCHITECTURE/render.md) — scene/sprite/dialog/menu drawing, `src/ui.js` window+glyph+digit chrome, .HEI passes
 - [tooling.md](ARCHITECTURE/tooling.md) — mg2tools.py CLI, compare.html A/B harness, debug save

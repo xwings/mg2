@@ -216,7 +216,10 @@ export function parseATTLevelTable(buf){
 }
 
 // PackBits (disasm 0x2480): b>=0x80 → (256-b+1) copies of next byte; else (b+1) literals.
-export function decodePBM(buf, pal){
+// `transparent` — treat palette index 0xFF as fully transparent, the
+// mode the status-screen portrait blit uses (disasm 0x73b2: PBIG*.PBM
+// decoded full-screen over the scene with 0xFF holes).
+export function decodePBM(buf, pal, transparent = false){
   const src = new Uint8Array(buf);
   const px = new Uint8Array(W * H);
   let i = 0, o = 0;
@@ -239,7 +242,7 @@ export function decodePBM(buf, pal){
   const ctx = c.getContext('2d');
   const img = ctx.createImageData(W, H);
   const rgba = new Uint32Array(img.data.buffer);
-  for(let k = 0; k < W*H; k++) rgba[k] = pal[px[k]];
+  for(let k = 0; k < W*H; k++) rgba[k] = (transparent && px[k] === 0xFF) ? 0 : pal[px[k]];
   ctx.putImageData(img, 0, 0);
   return c;
 }
@@ -312,6 +315,11 @@ export function parseNPCs(buf){
       const x2 = dv.getUint16(e+6, true);
       const sprite = dv.getUint16(e+8, true);
       const flag = dv.getUint16(e+10, true);
+      // Wander-AI fields (disasm 0x376C): +0x0E mobility (1 = walks),
+      // +0x10/+0x12 max wander distance from the (X2, Y2) anchor.
+      const mobility = dv.getUint16(e+14, true);
+      const rangeY = dv.getUint16(e+16, true);
+      const rangeX = dv.getUint16(e+18, true);
       if(x === 10 && y === 10 && sprite === 0) continue;
       // `rawIdx` is the position in the POL.DAT block before any filtering,
       // matching the disasm's `dx` counter at 0x2D0B onward. The script
@@ -327,6 +335,7 @@ export function parseNPCs(buf){
       // if its position collides with a 0xF000 script trigger.
       if(x < MCOLS && y < MROWS) npcs.push({
         x, y, x2, y2, sprite, flag,
+        mobility, rangeY, rangeX,
         hidden: false, spawned: false,
         rawIdx: i,
         _origX: x, _origY: y, _origX2: x2, _origY2: y2,
@@ -439,4 +448,213 @@ export function parseMG215(buf){
     }
   }
   return names;
+}
+
+// COLORM.DAT / COLOR.DAT — 10 × 256-byte palette-index remap LUTs
+// (window styles, shadows, tints; MG2.EXE loads the first 2560 bytes at
+// 0xab87, window fill uses table 2 by default via 0xB38B). Our canvas
+// is RGBA, not indexed, so a faithful per-pixel remap is impossible —
+// instead we precompute each table's average luminance ratio against
+// the palette and approximate the remap with an alpha overlay.
+export function parseColorLUTs(buf, pal){
+  const d = new Uint8Array(buf);
+  const luma = (c) => (c & 0xFF) * 0.299 + ((c >> 8) & 0xFF) * 0.587 + ((c >> 16) & 0xFF) * 0.114;
+  const tables = [];
+  for(let t = 0; t < 10; t++){
+    let inSum = 0, outSum = 0;
+    for(let i = 1; i < 256; i++){       // skip index 0 (black, 0/0)
+      inSum  += luma(pal[i]);
+      outSum += luma(pal[d[t*256 + i]]);
+    }
+    tables.push({darken: Math.max(0, Math.min(1, 1 - outSum / inSum))});
+  }
+  return tables;
+}
+
+// N15.T15 — the 8×8 digit font (640 bytes = 10 glyphs × 64, one byte
+// per pixel, 0xFF = transparent). Drawn by 0x12CD with a 1-px black
+// outline + 3-band vertical gradient base..base+2, so we keep the raw
+// coverage mask and let ui.js render per color base.
+export function parseN15(buf){
+  const d = new Uint8Array(buf);
+  const digits = [];
+  for(let g = 0; g < 10; g++){
+    const mask = new Uint8Array(64);
+    for(let i = 0; i < 64; i++) mask[i] = d[g*64 + i] !== 0xFF ? 1 : 0;
+    digits.push(mask);
+  }
+  return digits;
+}
+
+// Byte-per-pixel sprite with 0xFF = transparent and 0xFE = shadow
+// (originally a COLORM LUT remap of the pixel underneath — approximated
+// as 35% black). Used for M_IP.DAT (20×15 hand cursor ×2 frames),
+// DUO.DAT (15×15 skull), LIVE.DAT (20×18 !/? balloons ×2).
+export function parseRawSprite(buf, pal, w, h, frame = 0){
+  const d = new Uint8Array(buf);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  const img = cx.createImageData(w, h);
+  const px = new Uint32Array(img.data.buffer);
+  const base = frame * w * h;
+  for(let i = 0; i < w*h; i++){
+    const v = d[base + i];
+    if(v === 0xFF) px[i] = 0;
+    else if(v === 0xFE) px[i] = 0x59000000;      // shadow ≈ 35% black
+    else px[i] = pal[v];
+  }
+  cx.putImageData(img, 0, 0);
+  return c;
+}
+
+// Raw full-width image (SSLLP01.DAT battle panel = 320×50, MODE1/2.DAT
+// window textures = 320×200). One byte per pixel, no transparency.
+export function parseRawImage(buf, pal, w, h){
+  const d = new Uint8Array(buf);
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const cx = c.getContext('2d');
+  const img = cx.createImageData(w, h);
+  const px = new Uint32Array(img.data.buffer);
+  for(let i = 0; i < w*h; i++) px[i] = pal[d[i]];
+  cx.putImageData(img, 0, 0);
+  return c;
+}
+
+// AM.TOS — battle backdrops (ATT.LOD loader 0xbb05): 300-entry index of
+// u32 offsets stored [hi16][lo16], each record raw 320×150. Returns a
+// lazy accessor since only one backdrop is needed per battle.
+export function parseAMTOS(buf, pal){
+  const dv = new DataView(buf);
+  const cache = {};
+  return function backdrop(id){
+    if(id in cache) return cache[id];
+    if(id < 0 || id >= 300) return cache[id] = null;
+    // Header words are little-endian, high word first (same swap as
+    // ENEMY.TOS): off = (w0 << 16) | w1.
+    const off = (dv.getUint16(id*4, true) << 16) | dv.getUint16(id*4 + 2, true);
+    if(off < 1200 || off + 320*150 > buf.byteLength) return cache[id] = null;
+    const d = new Uint8Array(buf, off, 320*150);
+    const c = document.createElement('canvas');
+    c.width = 320; c.height = 150;
+    const cx = c.getContext('2d');
+    const img = cx.createImageData(320, 150);
+    const px = new Uint32Array(img.data.buffer);
+    for(let i = 0; i < 320*150; i++) px[i] = pal[d[i]];
+    cx.putImageData(img, 0, 0);
+    return cache[id] = c;
+  };
+}
+
+// ATTP.TOS — party battle sprites (ATT.LOD 0xb893): 4 members × 18
+// frames × 25×25, byte-per-pixel, 0xFF transparent. Frames: 0 idle,
+// 2 fallen, 3/4 attack swing, 7 hit, 8 dodge, 11 defend, 13/14 victory.
+export function parseATTP(buf, pal){
+  const d = new Uint8Array(buf);
+  const members = [];
+  for(let m = 0; m < 4; m++){
+    const frames = [];
+    for(let f = 0; f < 18; f++){
+      const c = document.createElement('canvas');
+      c.width = 25; c.height = 25;
+      const cx = c.getContext('2d');
+      const img = cx.createImageData(25, 25);
+      const px = new Uint32Array(img.data.buffer);
+      const base = m * 0x2BF2 + f * 0x271;
+      for(let i = 0; i < 625; i++){
+        const v = d[base + i];
+        px[i] = (v === 0xFF) ? 0 : pal[v];
+      }
+      cx.putImageData(img, 0, 0);
+      frames.push(c);
+    }
+    members.push(frames);
+  }
+  return members;
+}
+
+// MG2.EXE item table (disasm: DS:0x6B3, file offset 0xDAE3, read via
+// `imul bx, id, 0x14` at 0x6fbb / 0x4ebd / 0x9bfa …). 410 × 20-byte
+// records indexed by raw item id:
+//   +0x00  7 × i16 stat words. Equipment: added to the member's six
+//          effective stats (atk, def, spd, mgAtk, mgDef, x6) by the
+//          recompute at 0x6fbb. Consumables: [0] = HP restored,
+//          [1] = MP restored; boosters (ids 19-25, handler 0x56e8) map
+//          [0]=maxHp [1]=maxMp [2..6]=permanent atk/def/spd/mgAtk/mgDef.
+//   +0x0e  u16 equip-permission bitmask, bit n = party member n (0x4ebd)
+//   +0x10  u32 buy price (0x9c04); sell = price >> 1 (0x9f95);
+//          price 0 = unsellable quest item (0x9fb7)
+// Item name = P.15 glyph entry at the raw item id (renderer 0xA21).
+export function parseItemTable(buf){
+  const dv = new DataView(buf);
+  const BASE = 0xDAE3, N = 410;
+  const items = [];
+  for(let i = 0; i < N; i++){
+    const off = BASE + i * 20;
+    if(off + 20 > buf.byteLength) break;
+    const stats = [];
+    for(let s = 0; s < 7; s++) stats.push(dv.getInt16(off + s*2, true));
+    items.push({
+      id: i,
+      stats,
+      mask: dv.getUint16(off + 14, true),
+      price: dv.getUint32(off + 16, true),
+    });
+  }
+  return items;
+}
+
+// MG2.EXE compiled-in new-game state. Save block A initial image sits at
+// cs:0xb174 (file +0x200); party block B (DS:0x0004..0x04be) at file
+// 0xD430 (DS segment base, verified via the `.\S\BACK.DAT` string at
+// DS:0x3d67). Member records: 4 × 0xA0 bytes, fields per the layout at
+// disasm 0x6fbb / 0x74ee / 0x75d9 (see items.js for slot order).
+export function parseInitialState(buf){
+  const dv = new DataView(buf);
+  const SAVE = 0x200;              // cs-relative → file offset
+  const DS = 0xD430;               // DS:0 in the file image
+  const members = [];
+  for(let m = 0; m < 4; m++){
+    const b = DS + m * 0xA0;
+    const stat6 = [];
+    for(let s = 0; s < 6; s++) stat6.push(dv.getInt16(b + 0x20 + s*2, true));
+    members.push({
+      hp:     dv.getUint16(b + 0x04, true),
+      maxHp:  dv.getUint16(b + 0x06, true),
+      mp:     dv.getUint16(b + 0x08, true),
+      maxMp:  dv.getUint16(b + 0x0a, true),
+      level:  dv.getUint16(b + 0x12, true),
+      base: {atk: stat6[0], def: stat6[1], spd: stat6[2],
+             mgAtk: stat6[3], mgDef: stat6[4], x6: stat6[5]},
+      exp:     dv.getUint32(b + 0x3c, true),
+      expNext: dv.getUint32(b + 0x40, true),
+      // Slot order mirrors the record: +0x44 weapon, +0x46 shield,
+      // +0x48 helmet, +0x4a armor, +0x4c/+0x4e accessories. 0 = empty.
+      equipment: {
+        weapon: dv.getUint16(b + 0x44, true),
+        shield: dv.getUint16(b + 0x46, true),
+        helmet: dv.getUint16(b + 0x48, true),
+        armor:  dv.getUint16(b + 0x4a, true),
+        acc1:   dv.getUint16(b + 0x4c, true),
+        acc2:   dv.getUint16(b + 0x4e, true),
+      },
+    });
+  }
+  // Initial inventory image (DS:0x284, 82 × {u16 id, u16 count}).
+  const inventory = [];
+  for(let s = 0; s < 82; s++){
+    const off = DS + 0x284 + s*4;
+    const id = dv.getUint16(off, true);
+    const count = dv.getUint16(off + 2, true);
+    if(count > 0) inventory.push({id, count});
+  }
+  return {
+    gold: dv.getUint32(0xb1d1 + SAVE, true),
+    area: dv.getUint16(0xb1cd + SAVE, true),
+    x:    dv.getUint16(0xb1a3 + SAVE, true),
+    y:    dv.getUint16(0xb1b3 + SAVE, true),
+    members,
+    inventory,
+  };
 }

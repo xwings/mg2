@@ -1,19 +1,24 @@
 // NPC dialog + cutscene runner.
 //
 // An NPC's dialog block lives at `.15T` entries [rawIdx*10 .. rawIdx*10+9]
-// (disasm 0x2D86 → 0x8840). Entry +0 is an FF10-conditional dispatch
-// stub, +1 is the default page, +2..+9 are alternates selected by quest
-// state. We try the default then a few alternates if the default is empty.
+// (disasm 0x2D86 → 0x8840). Sub-entry 0 is the flag-check dispatch table
+// (handled by lookupStride60), +1 is the default page, +2..+9 are
+// alternates selected by quest state.
 //
 // State-mutating opcodes (FF20 flag set, FF60 NPC teleport, etc.) fire
 // via `applyScriptOps` when the player advances to each page. A callback
 // (`onPageOpsApplied`) lets the host re-evaluate quest-flag-dependent
 // systems (SJN blockers) immediately after each page.
+//
+// Shopkeepers/inns are NOT a separate NPC table: their dialog terminates
+// in FF01 (inn) / FF02 (item shop) / FF03 (equip shop), and the trade UI
+// opens when the dialog's last page is dismissed (disasm 0x8B82/0x8BAC/
+// 0x8BD6).
 
-import {runScript15T, applyScriptOps} from './script.js';
+import {runScript15T, runScript15Tat, lookupStride60, applyScriptOps} from './script.js';
 
 export function createDialogSystem({
-  state, npcData, getScript, shop, ST, scriptCtx, onPageOpsApplied,
+  state, npcData, getScript, shop, ST, scriptCtx, onPageOpsApplied, onClose,
 }){
   // Dialog state — read by the renderer for the dialog box, updated here.
   let currentNPC = null;
@@ -22,6 +27,7 @@ export function createDialogSystem({
   let ops = [];
   let pageIdx = 0;
   let appliedFor = -1;
+  let shopOp = null;      // pending FF01/FF02/FF03 from the current dialog
 
   function getState(){
     return {currentNPC, currentNPCName, pages, pageIdx};
@@ -35,18 +41,45 @@ export function createDialogSystem({
     if(onPageOpsApplied) onPageOpsApplied();
   }
 
+  // Dialog dismissed — either hand over to the shop UI (FF01/02/03
+  // terminator) or return to play.
+  function finish(){
+    // Trailing ops (pushed after the last page flush, e.g. an FF80 tile
+    // stamp at the end of a script) carry pageIdx == pages.length and
+    // would otherwise never fire.
+    applyScriptOps(ops, pages.length, scriptCtx);
+    if(onPageOpsApplied) onPageOpsApplied();
+    currentNPC = null;
+    if(onClose) onClose();
+    const op = shopOp;
+    shopOp = null;
+    if(op){
+      if(op.op === 0xFF01) shop.openInn(op.price, ST);
+      else shop.openShop(op.stock, op.op === 0xFF03 ? 'equip' : 'items', ST);
+      return;
+    }
+    state.state = ST.PLAY;
+  }
+
   function advance(){
     pageIdx++;
     if(pageIdx >= pages.length){
-      state.state = ST.PLAY;
-      currentNPC = null;
+      finish();
       return;
     }
     applyPageOps();
   }
   function close(){
-    state.state = ST.PLAY;
-    currentNPC = null;
+    finish();
+  }
+
+  function setResult(r){
+    pages = r.pages;
+    ops = r.ops || [];
+    shopOp = ops.find(o => o.op >= 0xFF01 && o.op <= 0xFF03) || null;
+    pageIdx = 0;
+    appliedFor = -1;
+    for(const eff of r.effects){ if(eff.type === 'gold') state.gold += eff.value; }
   }
 
   // Open a freeform script entry (used for cutscenes like TS001).
@@ -60,45 +93,42 @@ export function createDialogSystem({
   // Open a parsed script-run result directly (used for stride-60
   // fountain / notice-board scripts that don't map to a normal entry).
   function openResult(r, speakerName = '', speakerSprite = null){
-    if(!r || r.pages.length === 0) return false;
-    pages = r.pages;
-    ops = r.ops || [];
-    pageIdx = 0;
-    appliedFor = -1;
+    if(!r || (r.pages.length === 0 && !(r.ops || []).some(o => o.op >= 0xFF01 && o.op <= 0xFF03))) return false;
+    setResult(r);
     currentNPCName = speakerName;
     currentNPC = speakerSprite != null ? {sprite: speakerSprite} : null;
-    for(const eff of r.effects){ if(eff.type === 'gold') state.gold += eff.value; }
+    if(pages.length === 0){ finish(); return true; }   // pure shop stub
     state.state = ST.NPC_TALK;
     applyPageOps();
     return true;
   }
 
-  // Open an NPC's dialog. Falls through to the shop/inn UI if the NPC
-  // is registered in SHOP_BY_NPC; returns null/empty if no dialog exists.
+  // Open an NPC's dialog via the stride-60 flag dispatcher — the same
+  // path MG2.EXE takes (0x2D86 → 0x8840 with dx = rawIdx). Falls back to
+  // scanning sub-entries 1-4 when the dispatch table yields nothing.
   async function openNPCTalk(npc){
     const aScript = npcData[state.curArea]?.script || '';
     const rawIdx = npc.rawIdx ?? (npcData[state.curArea]?.npcs || []).indexOf(npc);
-    if(shop.tryOpenShop(state.curArea, rawIdx, ST)) return {opened: 'shop'};
     const scr = await getScript(aScript);
     if(!scr) return {opened: 'none', reason: 'no-script', scriptName: aScript};
-    let found = false;
-    for(let p = 1; p <= 4; p++){
-      const idx = rawIdx * 10 + p;
-      if(idx >= scr.entries.length) continue;
-      const r = runScript15T(scr, idx);
-      if(r.pages.length > 0){
-        pages = r.pages;
-        ops = r.ops || [];
-        for(const eff of r.effects){ if(eff.type === 'gold') state.gold += eff.value; }
-        found = true;
-        break;
+    let r = null;
+    const sub = lookupStride60(scr, rawIdx, scriptCtx.flags);
+    if(sub) r = runScript15Tat(scr, sub.off, sub.size);
+    if(!r || (r.pages.length === 0 && r.ops.length === 0)){
+      for(let p = 1; p <= 4; p++){
+        const idx = rawIdx * 10 + p;
+        if(idx >= scr.entries.length) continue;
+        const alt = runScript15T(scr, idx);
+        if(alt.pages.length > 0){ r = alt; break; }
       }
     }
-    if(!found) return {opened: 'none', reason: 'empty', rawIdx};
+    if(!r || (r.pages.length === 0 && !r.ops.some(o => o.op >= 0xFF01 && o.op <= 0xFF03))){
+      return {opened: 'none', reason: 'empty', rawIdx};
+    }
+    setResult(r);
     currentNPC = npc;
     currentNPCName = '';
-    pageIdx = 0;
-    appliedFor = -1;
+    if(pages.length === 0){ finish(); return {opened: 'shop', rawIdx}; }
     state.state = ST.NPC_TALK;
     applyPageOps();
     return {opened: 'dialog', rawIdx};

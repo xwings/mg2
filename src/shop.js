@@ -1,159 +1,46 @@
-// Shop + inn system.
+// Shop + inn system, driven by the .15T shop opcodes.
 //
-// A shop is a specific NPC whose dialog is replaced by a buy/sell UI. The
-// original game's shop dialog fires a special opcode that opens the trading
-// screen (shop1.png / shop2.png reference). Until that opcode is decoded we
-// use a data table keyed by `(area:rawIdx)` with the shopkeeper's stock.
+// The original opens the trade UI from three dialog terminators
+// (disasm 0x8B82/0x8BAC/0x8BD6):
+//   FF01 → inn: param = advertised price. On "yes" the screen fades and
+//          the whole party is fully healed (0x98DD → 0x244 fade →
+//          0x9941 heal). The price is DISPLAY ONLY — no code path ever
+//          deducts it from gold (verified against every write to
+//          cs:0xb1d1), and we reproduce that quirk.
+//   FF02 → item shop, FF03 → equipment shop: params = 10 stock item
+//          ids (0x3E7 = empty). Prices come from the item table
+//          (+0x10 dword); buy checks gold (0x9c04) and stack space
+//          (99/stack, 82 slots — 0x15db); quantity picker 1..99 with
+//          ±1/±10 steps (0x998F). Sell price = price >> 1 (0x9f95);
+//          price-0 items are unsellable quest goods (0x9fb7).
 //
-// An "inn" shopkeeper restores HP/MP for a fixed gold cost — shopkeeper
-// asks, player accepts, gold deducts, screen briefly fades, stats refill.
-//
-// Adding a new shop: pick the NPC's area + raw POL.DAT index, add a line
-// to SHOP_BY_NPC below with its type + items.
+// dialog.js calls openInn/openShop when an NPC's dialog ends in one of
+// these opcodes — there is no NPC→shop mapping table in the game.
 
-// Catalog of sellable goods. `id` is arbitrary (unique per item); `stat`
-// describes the stat delta if EQUIPPED. Consumables set `source: 'potion'`
-// or `'magic'` — battle.js `itemEffect()` reads that to decide the heal.
-//
-// Keep shop item ids ≥ 200 so they don't collide with GEM.DAT treasure ids.
-// Items are grouped by tier: basic (200s), mid (230s), advanced (260s),
-// legendary (290s). Each village stocks the tier that matches its story
-// position (see SHOP_BY_NPC below).
-export const SHOP_ITEMS = {
-  // ── Weapons ───────────────────────────────────────────
-  200: {name: '木棍',    price: 10,  kind: 'weapon', atk: 2},
-  201: {name: '小刀',    price: 25,  kind: 'weapon', atk: 3},
-  202: {name: '銅劍',    price: 30,  kind: 'weapon', atk: 5},
-  230: {name: '鐵劍',    price: 120, kind: 'weapon', atk: 12},
-  231: {name: '戰斧',    price: 180, kind: 'weapon', atk: 16},
-  232: {name: '長矛',    price: 150, kind: 'weapon', atk: 14, spd: 2},
-  260: {name: '鋼劍',    price: 300, kind: 'weapon', atk: 20},
-  261: {name: '雙刃劍',  price: 450, kind: 'weapon', atk: 24, spd: 1},
-  262: {name: '銀劍',    price: 500, kind: 'weapon', atk: 22, mgAtk: 4},
-  290: {name: '魔法劍',  price: 800, kind: 'weapon', atk: 32, mgAtk: 6},
-  291: {name: '聖劍',    price: 1500,kind: 'weapon', atk: 45, mgAtk: 10},
-  // ── Armor / shields / helms ──────────────────────────
-  210: {name: '布衣',    price: 22,  kind: 'armor',  def: 2},
-  211: {name: '皮甲',    price: 75,  kind: 'armor',  def: 4},
-  212: {name: '皮盾',    price: 130, kind: 'armor',  def: 7},
-  240: {name: '鐵甲',    price: 260, kind: 'armor',  def: 12},
-  241: {name: '銀盾',    price: 340, kind: 'armor',  def: 10, mgDef: 3},
-  242: {name: '鐵帽',    price: 180, kind: 'armor',  def: 6},
-  270: {name: '鋼甲',    price: 520, kind: 'armor',  def: 18},
-  271: {name: '鋼盾',    price: 600, kind: 'armor',  def: 14, mgDef: 5},
-  280: {name: '龍鱗甲',  price: 1200,kind: 'armor',  def: 28, mgDef: 8},
-  // ── Accessories ───────────────────────────────────────
-  214: {name: '皮帽子',  price: 150, kind: 'armor',  def: 5},
-  215: {name: '髮圈',    price: 210, kind: 'armor',  spd: 3},
-  250: {name: '銀戒指',  price: 400, kind: 'armor',  mgDef: 4, spd: 2},
-  251: {name: '力手環',  price: 350, kind: 'armor',  atk: 3, def: 2},
-  285: {name: '神秘護符',price: 900, kind: 'armor',  mgAtk: 6, mgDef: 6},
-  // ── Consumables ───────────────────────────────────────
-  // Low tier
-  220: {name: '藥草',    price: 15,  kind: 'potion', source: 'potion'},
-  221: {name: '魔水',    price: 30,  kind: 'magic',  source: 'magic'},
-  222: {name: '解毒藥',  price: 20,  kind: 'potion', source: 'potion'},
-  // Mid tier
-  225: {name: '大藥草',  price: 50,  kind: 'potion', source: 'potion'},
-  226: {name: '大魔水',  price: 90,  kind: 'magic',  source: 'magic'},
-  // High tier
-  228: {name: '神仙水',  price: 200, kind: 'potion', source: 'potion'},
-  229: {name: '回生丹',  price: 300, kind: 'potion', source: 'potion'},
-};
+import {slotForItem, canEquip} from './items.js';
 
-// Stock presets keyed by TIER — reused across villages so a shop's stock
-// scales with where in the story you find it.
-const STOCK = {
-  // Tier 1 — spawn-town villages (C02-1 etc.)
-  weapons1: [200, 201, 202, 230, 210, 211, 214],
-  items1:   [220, 221, 222],
-  inn1:     8,
-  // Tier 2 — mid-game villages (C03-1 / C04-1 etc.)
-  weapons2: [230, 231, 232, 211, 212, 242, 214, 215],
-  items2:   [220, 225, 226, 222],
-  inn2:     20,
-  // Tier 3 — late villages / fortress towns (C07-1 etc.)
-  weapons3: [260, 261, 262, 240, 241, 251, 215, 250],
-  items3:   [225, 226, 228, 229, 222],
-  inn3:     50,
-  // Tier 4 — final / hidden shops
-  weapons4: [290, 291, 270, 271, 280, 285, 250, 251],
-  items4:   [228, 229, 226, 225],
-  inn4:     120,
-};
-
-// Shop ↔ NPC mapping. Each entry hides the NPC's normal dialog and opens
-// the trade UI instead. `type: 'weapons' | 'items' | 'inn'`. The shopkeeper
-// is the specific NPC at its raw POL.DAT position; the player stands
-// 1–2 tiles away and presses SPACE (our `getFacingNPC` reaches over the
-// counter).
-//
-// Multiple areas share the same map filename (`C02-1` / `C03-1` / etc.) —
-// they're separate buildings reusing the same tileset, so each has its own
-// shop entry and stock.
-export const SHOP_BY_NPC = {
-  // ── C02-1 (area 107) — the first proper village ─────────────────────
-  '107:0': {type: 'weapons', sells: STOCK.weapons1},   // (20, 7) weapon/armor
-  '107:1': {type: 'items',   sells: STOCK.items1},     // (57, 10) pharmacist
-  '107:2': {type: 'inn',     cost:  STOCK.inn1},       // (30, 39) innkeeper
-
-  // ── C02-1 (area 108) — sister village, same tier ────────────────────
-  '108:1': {type: 'weapons', sells: STOCK.weapons1},   // (58, 10) weapons
-  '108:3': {type: 'items',   sells: STOCK.items1},     // (54, 15) items
-  '108:5': {type: 'inn',     cost:  STOCK.inn1},       // (129, 74) inn
-
-  // ── C02-1 (area 110) — tier 2 stock (further town) ──────────────────
-  '110:1': {type: 'weapons', sells: STOCK.weapons2},   // (57, 10)
-  '110:3': {type: 'items',   sells: STOCK.items2},     // (137, 60)
-  '110:5': {type: 'inn',     cost:  STOCK.inn2},       // (69, 78)
-
-  // ── C03-1 (area 109) — tier 2 equipment ─────────────────────────────
-  '109:2': {type: 'weapons', sells: STOCK.weapons2},   // (20, 7)
-  '109:3': {type: 'items',   sells: STOCK.items2},     // (148,106)
-
-  // ── C03-1 (area 113) — tier 2/3 ─────────────────────────────────────
-  '113:0': {type: 'weapons', sells: STOCK.weapons2},   // (69, 56)
-  '113:4': {type: 'items',   sells: STOCK.items2},     // (146,109)
-  '113:7': {type: 'inn',     cost:  STOCK.inn2},       // (29, 49)
-
-  // ── C07-1 (area 112) — tier 3 fortress town ─────────────────────────
-  '112:0': {type: 'weapons', sells: STOCK.weapons3},   // (88, 14)
-  '112:4': {type: 'items',   sells: STOCK.items3},     // (160,14)
-  '112:1': {type: 'inn',     cost:  STOCK.inn3},       // (20,109)
-
-  // ── C09-1 (area 115) — late-game ────────────────────────────────────
-  '115:1': {type: 'weapons', sells: STOCK.weapons3},   // (57, 10)
-  '115:3': {type: 'items',   sells: STOCK.items3},     // (17, 39)
-  '115:6': {type: 'inn',     cost:  STOCK.inn3},       // (64,108)
-
-  // ── C11-1 (area 117) — late-game ────────────────────────────────────
-  '117:0': {type: 'weapons', sells: STOCK.weapons3},   // (69, 56)
-  '117:5': {type: 'items',   sells: STOCK.items3},     // (83, 57)
-
-  // ── C12-1 (area 118) — hidden / final shop ──────────────────────────
-  '118:0': {type: 'weapons', sells: STOCK.weapons4},   // (184, 61)
-};
-
-export function createShopSystem(state, areas, stringTable, itemTables){
-  // ST constants are passed in at wire-up time from main.js.
+export function createShopSystem({state, itemTable, itemGlyphs, ui, stringTable}){
   let shop = null;   // active trade session
 
-  // Opens a shop for NPC (or null if NPC isn't a shopkeeper).
-  function tryOpenShop(areaId, npcRawIdx, ST){
-    const key = areaId + ':' + npcRawIdx;
-    const def = SHOP_BY_NPC[key];
-    if(!def) return false;
+  function openShop(stock, kind, ST){
     shop = {
-      def,
-      type: def.type,
-      mode: def.type === 'inn' ? 'inn-prompt' : 'menu',
-      menu: 0,           // 0 = Buy, 1 = Sell, 2 = Leave
-      listIdx: 0,        // cursor in buy/sell list
-      listScroll: 0,
-      confirm: false,    // awaiting yes/no on a purchase
+      type: kind,                    // 'items' | 'equip'
+      stock: (stock || []).filter(id => itemTable[id]),
+      mode: 'menu',
+      menu: 0,                       // 0 = Buy, 1 = Sell, 2 = Leave
+      listIdx: 0,
+      qty: 1,                        // quantity-picker value
       msg: '',
       msgTimer: 0,
     };
+    state.state = ST.SHOP;
+    return true;
+  }
+
+  function openInn(price, ST){
+    // yesNo = 0 (是) / 1 (否) — the 0x13A0 selector widget defaults to
+    // "yes" and toggles with left/right.
+    shop = {type: 'inn', price, mode: 'inn-prompt', yesNo: 0, msg: '', msgTimer: 0};
     state.state = ST.SHOP;
     return true;
   }
@@ -163,74 +50,61 @@ export function createShopSystem(state, areas, stringTable, itemTables){
     state.state = ST.PLAY;
   }
 
-  function getBuyList(){
-    return (shop.def.sells || []).map(id => ({id, def: SHOP_ITEMS[id]})).filter(x => x.def);
-  }
-
   function inventoryRef(){
     return state._inventoryRef;   // set by main.js wire-up
   }
 
-  function sellPriceFor(item){
-    // Half of book price (rounded) — classic JRPG buyback.
-    const def = SHOP_ITEMS[item.id];
-    const base = def?.price ?? 10;
-    return Math.max(1, Math.floor(base / 2));
+  function heldCount(id){
+    const it = inventoryRef()?.find(i => i.id === id);
+    return it ? (it.count || 1) : 0;
   }
 
-  function confirmBuy(ST){
-    const list = getBuyList();
-    const entry = list[shop.listIdx];
-    if(!entry) return;
-    const {def} = entry;
-    if(state.gold < def.price){
-      shop.msg = '金錢不足'; shop.msgTimer = 800; return;
+  // Max purchasable quantity: gold / price, capped by stack space
+  // (disasm 0x9c69 divide + 0x1665 held-count check, 99/stack).
+  function maxBuyQty(id){
+    const price = itemTable[id].price;
+    const byGold = price > 0 ? Math.floor(state.gold / price) : 99;
+    return Math.max(0, Math.min(byGold, 99 - heldCount(id)));
+  }
+
+  function commitBuy(id, qty){
+    const inv = inventoryRef();
+    if(!inv) return;
+    state.gold -= itemTable[id].price * qty;
+    const existing = inv.find(i => i.id === id);
+    if(existing) existing.count += qty;
+    else inv.push({id, count: qty});
+    shop.msg = '多謝惠顧';
+    shop.msgTimer = 800;
+  }
+
+  function commitSell(it, qty){
+    const inv = inventoryRef();
+    state.gold += (itemTable[it.id].price >> 1) * qty;
+    it.count -= qty;
+    if(it.count <= 0){
+      inv.splice(inv.indexOf(it), 1);
+      if(shop.listIdx >= inv.length) shop.listIdx = Math.max(0, inv.length - 1);
     }
-    state.gold -= def.price;
-    const inv = inventoryRef();
-    if(!inv) return;
-    // Inventory entry uses the same shape as GEM pickups so the menu and
-    // battle item code don't need special cases.
-    const existing = inv.find(i => i.id === entry.id);
-    if(existing) existing.count++;
-    else inv.push({
-      id:     entry.id,
-      count:  1,
-      kind:   def.kind,
-      source: def.source || def.kind,
-      glyphs: null,       // shop items have names only, no MG2.15 glyphs
-      shopName: def.name,
-    });
-    shop.msg = '購入 ' + def.name;
+    shop.msg = '多謝!';
     shop.msgTimer = 800;
-  }
-
-  function confirmSell(ST){
-    const inv = inventoryRef();
-    if(!inv) return;
-    const it = inv[shop.listIdx];
-    if(!it){ shop.mode = 'menu'; return; }
-    const price = sellPriceFor(it);
-    state.gold += price;
-    it.count = (it.count || 1) - 1;
-    if(it.count <= 0) inv.splice(shop.listIdx, 1);
-    if(shop.listIdx >= inv.length) shop.listIdx = Math.max(0, inv.length - 1);
-    shop.msg = '+' + price + 'G';
-    shop.msgTimer = 800;
-    if(inv.length === 0){ shop.mode = 'menu'; }
+    if(inv.length === 0) shop.mode = 'menu';
   }
 
   function innRest(ST){
-    if(state.gold < shop.def.cost){
-      shop.msg = '金錢不足'; shop.msgTimer = 800;
-      shop.mode = 'inn-prompt'; return;
-    }
-    state.gold -= shop.def.cost;
-    state.hp = state.maxHp;
-    state.mp = state.maxMp;
+    // Fade + full party heal (HP, MP, status). The advertised price is
+    // never charged — original behavior.
+    for(const m of state.party){ m.hp = m.maxHp; m.mp = m.maxMp; m.defending = 0; }
     shop.msg = 'HP/MP回復';
     shop.msgTimer = 1500;
     shop.mode = 'inn-done';
+  }
+
+  function adjustQty(pressedKey, max){
+    if(pressedKey === 'ArrowUp')    shop.qty = Math.min(max, shop.qty + 1);
+    if(pressedKey === 'ArrowDown')  shop.qty = Math.max(1, shop.qty - 1);
+    if(pressedKey === 'ArrowRight') shop.qty = Math.min(max, shop.qty + 10);
+    if(pressedKey === 'ArrowLeft')  shop.qty = Math.max(1, shop.qty - 10);
   }
 
   function tick(pressedKey, ST){
@@ -249,10 +123,10 @@ export function createShopSystem(state, areas, stringTable, itemTables){
       if(pressedKey === 'ArrowDown') shop.menu = (shop.menu + 1) % 3;
       if(pressedKey === 'Escape'){ closeShop(ST); return; }
       if(pressedKey === 'Space' || pressedKey === 'Enter'){
-        if(shop.menu === 0){ shop.mode = 'buy';  shop.listIdx = 0; shop.listScroll = 0; }
+        if(shop.menu === 0){ shop.mode = 'buy'; shop.listIdx = 0; }
         else if(shop.menu === 1){
           if(!inv || inv.length === 0){ shop.msg = '物品無'; shop.msgTimer = 700; }
-          else { shop.mode = 'sell'; shop.listIdx = 0; shop.listScroll = 0; }
+          else { shop.mode = 'sell'; shop.listIdx = 0; }
         }
         else closeShop(ST);
       }
@@ -260,11 +134,31 @@ export function createShopSystem(state, areas, stringTable, itemTables){
     }
 
     if(shop.mode === 'buy'){
-      const list = getBuyList();
-      if(pressedKey === 'ArrowUp')   shop.listIdx = (shop.listIdx + list.length - 1) % list.length;
-      if(pressedKey === 'ArrowDown') shop.listIdx = (shop.listIdx + 1) % list.length;
+      const n = shop.stock.length;
+      if(n === 0){ shop.mode = 'menu'; return; }
+      if(pressedKey === 'ArrowUp')   shop.listIdx = (shop.listIdx + n - 1) % n;
+      if(pressedKey === 'ArrowDown') shop.listIdx = (shop.listIdx + 1) % n;
       if(pressedKey === 'Escape')   { shop.mode = 'menu'; return; }
-      if(pressedKey === 'Space' || pressedKey === 'Enter') confirmBuy(ST);
+      if(pressedKey === 'Space' || pressedKey === 'Enter'){
+        const id = shop.stock[shop.listIdx];
+        if(state.gold < itemTable[id].price){
+          shop.msg = '金錢不足'; shop.msgTimer = 800; return;
+        }
+        if(maxBuyQty(id) < 1){ shop.msg = '不能再拿'; shop.msgTimer = 800; return; }
+        shop.qty = 1;
+        shop.mode = 'buy-qty';
+      }
+      return;
+    }
+
+    if(shop.mode === 'buy-qty'){
+      const id = shop.stock[shop.listIdx];
+      adjustQty(pressedKey, maxBuyQty(id));
+      if(pressedKey === 'Escape') shop.mode = 'buy';
+      if(pressedKey === 'Space' || pressedKey === 'Enter'){
+        commitBuy(id, shop.qty);
+        shop.mode = 'buy';
+      }
       return;
     }
 
@@ -273,136 +167,161 @@ export function createShopSystem(state, areas, stringTable, itemTables){
       if(pressedKey === 'ArrowUp')   shop.listIdx = (shop.listIdx + inv.length - 1) % inv.length;
       if(pressedKey === 'ArrowDown') shop.listIdx = (shop.listIdx + 1) % inv.length;
       if(pressedKey === 'Escape')   { shop.mode = 'menu'; return; }
-      if(pressedKey === 'Space' || pressedKey === 'Enter') confirmSell(ST);
+      if(pressedKey === 'Space' || pressedKey === 'Enter'){
+        const it = inv[shop.listIdx];
+        if(!itemTable[it.id] || itemTable[it.id].price === 0){
+          shop.msg = '不能賣'; shop.msgTimer = 800; return;
+        }
+        shop.qty = 1;
+        shop.mode = 'sell-qty';
+      }
+      return;
+    }
+
+    if(shop.mode === 'sell-qty'){
+      const it = inv[shop.listIdx];
+      if(!it){ shop.mode = 'sell'; return; }
+      adjustQty(pressedKey, it.count || 1);
+      if(pressedKey === 'Escape') shop.mode = 'sell';
+      if(pressedKey === 'Space' || pressedKey === 'Enter'){
+        commitSell(it, shop.qty);
+        shop.mode = 'sell';
+      }
       return;
     }
 
     if(shop.mode === 'inn-prompt'){
-      // Yes/No via Space (yes) / Escape (no).
-      if(pressedKey === 'Space' || pressedKey === 'Enter') innRest(ST);
+      // 是/否 selector (disasm 0x13A0): left/right toggle the choice,
+      // confirm acts on the highlighted option, Esc = 否.
+      if(pressedKey === 'ArrowLeft' || pressedKey === 'ArrowRight' ||
+         pressedKey === 'ArrowUp' || pressedKey === 'ArrowDown'){
+        shop.yesNo ^= 1;
+      }
+      if(pressedKey === 'Space' || pressedKey === 'Enter'){
+        if(shop.yesNo === 0) innRest(ST);
+        else closeShop(ST);
+      }
       if(pressedKey === 'Escape') closeShop(ST);
       return;
     }
   }
 
+  // Compare arrow vs the equipped piece in the same slot (equip-shop
+  // party panel, disasm 0x7e80-0x80cd): weapon compares stat[0],
+  // armor/shield/helmet stat[1], accessories stat[2]. Uses MG2.15
+  // glyphs #0xC (better) / #0xD (worse) / #9 (equal) like the original.
+  function compareEntry(id){
+    const slot = slotForItem(id);
+    if(!slot) return null;
+    if(!canEquip(itemTable[id], 0)) return {entry: null, x: true};
+    const key = slot === 'weapon' ? 0 : (slot === 'acc1' || slot === 'acc2') ? 2 : 1;
+    const m = state.party[0];
+    const cur = m.equipment[slot] ? itemTable[m.equipment[slot]].stats[key] : 0;
+    const cand = itemTable[id].stats[key];
+    return {entry: cand > cur ? 0x0C : cand < cur ? 0x0D : 0x09};
+  }
+
+  // Shop screen — authentic chrome (disasm 0x76D6 item / 0x793F equip):
+  // stock window (5,3) 310×112, gold box (10,110) 120×25, 2-col grid,
+  // hand cursor + red selection frame, prompt line in the dialog window.
+  function drawGoldBox(){
+    ui.drawWindow(10, 110, 120, 25);
+    ui.drawString(0x13D, 18, 115, 0x2B);                    // 金錢
+    ui.drawNum(state.gold, 60, 119, 1, {leftPack: true});
+  }
+
   function draw(ctx, W, H){
     if(!shop) return;
-    const boxY = H - 88, boxH = 88;
 
-    // Background panel — parchment/wood look.
-    ctx.fillStyle = '#2a1810';
-    ctx.fillRect(0, boxY, W, boxH);
-    ctx.fillStyle = '#5a3520';
-    ctx.fillRect(2, boxY + 2, W - 4, boxH - 4);
-    ctx.strokeStyle = '#1a0a05';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(0.5, boxY + 0.5, W - 1, boxH - 1);
-
-    ctx.fillStyle = '#ffe';
-    ctx.font = '8px monospace';
-
-    if(shop.type === 'inn' && (shop.mode === 'inn-prompt' || shop.mode === 'inn-done')){
-      ctx.fillText('歡迎光臨客棧！', 8, boxY + 16);
-      ctx.fillText('住宿一晚 ' + shop.def.cost + ' G。', 8, boxY + 32);
-      ctx.fillText('HP/MP 全回復', 8, boxY + 46);
-      ctx.fillStyle = '#ff0';
-      ctx.fillText('SPACE 住宿   ESC 離開', 8, boxY + 74);
-      ctx.fillStyle = '#fff';
-      ctx.fillText('持有: ' + state.gold + ' G', W - 110, boxY + 16);
-      if(shop.msg){
-        ctx.fillStyle = '#0f0';
-        ctx.fillText(shop.msg, 8, boxY + 60);
+    if(shop.type === 'inn'){
+      if(shop.mode === 'inn-prompt'){
+        ui.drawWindow(0, 140, W, 60);
+        const x = ui.drawString(0x258, 10, 145, 1);         // 歡迎光臨…住宿一晚
+        ui.drawNum(shop.price, x + 2, 145, 0x2B, {leftPack: true, font: 'big'});
+        ui.drawString(0x259, 10, 165, 1);                   // 元。請問您要住宿嗎？
+        // 是/否 selector — the highlighted option uses the fire gradient
+        // (0x13A0: selected color 0xEF, unselected 1).
+        ui.drawWindow(250, 125, 60, 25);
+        ui.drawString(0x384, 258, 130, shop.yesNo === 0 ? 0xEF : 1);
+        ui.drawString(0x385, 284, 130, shop.yesNo === 1 ? 0xEF : 1);
+      } else {
+        // inn-done: the original fades the palette to black while the
+        // party sleeps (0x98DD → 0x244), then fades back in. Approximate
+        // the sleep with a black overlay that peaks mid-way through the
+        // rest timer.
+        const t = Math.max(0, Math.min(1, 1 - shop.msgTimer / 1500));
+        const alpha = Math.sin(t * Math.PI);
+        ctx.fillStyle = 'rgba(0,0,0,' + alpha.toFixed(3) + ')';
+        ctx.fillRect(0, 0, W, H);
       }
       return;
     }
 
     if(shop.mode === 'menu'){
-      ctx.fillText('歡迎光臨！', 8, boxY + 14);
-      ctx.fillText('請選擇服務：', 8, boxY + 28);
-      const opts = ['買', '賣', '離開'];
-      for(let i = 0; i < opts.length; i++){
-        ctx.fillStyle = i === shop.menu ? '#ff0' : '#ddc';
-        ctx.fillText((i === shop.menu ? '▶ ' : '  ') + opts[i], 16, boxY + 46 + i * 11);
-      }
-      ctx.fillStyle = '#fff';
-      ctx.fillText('持有: ' + state.gold + ' G', W - 110, boxY + 14);
-      if(shop.msg){
-        ctx.fillStyle = '#ff0';
-        ctx.fillText(shop.msg, W - 110, boxY + 28);
+      // Greeting in dialog window + 買/賣/離開 chooser.
+      ui.drawWindow(0, 140, W, 60);
+      ui.drawString(0x28A, 10, 145, 1);                     // 歡迎光臨！…
+      ui.drawWindow(250, 120, 62, 40);
+      const opts = [0x294, 0x295, 0x1FD];                   // 買 賣 (結束)
+      for(let i = 0; i < 3; i++){
+        ui.drawString(opts[i], 258, 125 + i * 11, i === shop.menu ? 0xEF : 1);
       }
       return;
     }
 
-    if(shop.mode === 'buy'){
-      const list = getBuyList();
-      ctx.fillStyle = '#ff0';
-      ctx.fillText('買什麼？', 8, boxY + 12);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(state.gold + ' G', W - 50, boxY + 12);
-      // Two-column grid — up to 8 items.
-      const visible = list.slice(0, 8);
-      for(let i = 0; i < visible.length; i++){
-        const {def} = visible[i];
-        const col = i % 2, row = Math.floor(i / 2);
-        const cx = 8 + col * 150, cy = boxY + 22 + row * 12;
-        ctx.fillStyle = i === shop.listIdx ? '#ff0' : '#ccc';
-        ctx.fillText((i === shop.listIdx ? '▶ ' : '  ') + def.name, cx, cy);
-        ctx.fillStyle = i === shop.listIdx ? '#ff0' : '#9a7';
-        ctx.fillText(String(def.price).padStart(3) + 'G', cx + 90, cy);
-      }
-      // Selected-item stat preview.
-      const sel = list[shop.listIdx];
-      if(sel){
-        const d = sel.def;
-        const parts = [];
-        if(d.atk) parts.push('ATK +' + d.atk);
-        if(d.def) parts.push('DEF +' + d.def);
-        if(d.spd) parts.push('SPD +' + d.spd);
-        if(d.kind === 'potion') parts.push('HP 回復');
-        if(d.kind === 'magic')  parts.push('MP 回復');
-        ctx.fillStyle = '#8f8';
-        ctx.fillText(parts.join('   ') || d.kind, 8, boxY + boxH - 6);
-      }
-      ctx.fillStyle = '#aaa';
-      ctx.font = '7px monospace';
-      ctx.fillText('SPACE 購買   ESC 返回', W - 140, boxY + boxH - 6);
+    const buying = shop.mode === 'buy' || shop.mode === 'buy-qty';
+    const inv = inventoryRef() || [];
+    const list = buying ? shop.stock : inv.map(it => it.id);
+
+    // Stock/inventory window + gold box.
+    ui.drawWindow(5, 3, 310, 112);
+    drawGoldBox();
+
+    // Prompt in the dialog window (0x29E buy / 0x2B2 sell).
+    ui.drawWindow(0, 140, W, 60);
+    ui.drawString(buying ? 0x29E : 0x2B2, 10, 145, 0xBA);
+    if(shop.msg){
+      ctx.fillStyle = ui.css(0xBA);
       ctx.font = '8px monospace';
-      if(shop.msg){
-        ctx.fillStyle = '#0f0';
-        ctx.fillText(shop.msg, W - 120, boxY + 24);
-      }
-      return;
+      ctx.fillText(shop.msg, 10, 172);
     }
 
-    if(shop.mode === 'sell'){
-      const inv = inventoryRef() || [];
-      ctx.fillStyle = '#ff0';
-      ctx.fillText('賣什麼？', 8, boxY + 12);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(state.gold + ' G', W - 50, boxY + 12);
-      const visible = inv.slice(0, 8);
-      for(let i = 0; i < visible.length; i++){
-        const it = visible[i];
-        const col = i % 2, row = Math.floor(i / 2);
-        const cx = 8 + col * 150, cy = boxY + 22 + row * 12;
-        ctx.fillStyle = i === shop.listIdx ? '#ff0' : '#ccc';
-        const name = it.shopName || SHOP_ITEMS[it.id]?.name ||
-                     (stringTable?.[it.id] ? '#' + it.id : '?');
-        ctx.fillText((i === shop.listIdx ? '▶ ' : '  ') +
-          name.substr(0, 8) + ' x' + it.count, cx, cy);
-        ctx.fillStyle = i === shop.listIdx ? '#ff0' : '#9a7';
-        ctx.fillText(sellPriceFor(it) + 'G', cx + 110, cy);
+    // 2-column × 5-row grid. Cell origins from the LUT: x = 26/166.
+    const first = Math.max(0, Math.min((shop.listIdx | 0) - 4, Math.max(0, list.length - 10)));
+    for(let k = 0; k < Math.min(10, list.length - first); k++){
+      const i = first + k;
+      const id = list[i];
+      const col = k % 2, row = (k / 2) | 0;
+      const cx = 26 + col * 140, cy = 11 + row * 20;
+      const sel = i === shop.listIdx;
+      if(sel){ ui.drawSelBar(cx - 5, cy - 3, 130, 18); ui.drawHand(cx - 15, cy + 2); }
+      const g = itemGlyphs(id);
+      if(g) ui.drawGlyphs(g, cx + 8, cy + 6, sel ? 0xEF : 0x71);
+      // Price (buy) or sell price (half).
+      const rec = itemTable[id];
+      const price = buying ? rec.price : (rec && rec.price ? rec.price >> 1 : 0);
+      ui.drawNum(price, cx + 78, cy + 10, 0x2B, {leftPack: true});
+      if(!buying) ui.drawNum(inv[i].count, cx + 108, cy + 10, 1, {cells: 2});
+      if(buying && shop.type === 'equip'){
+        const c = compareEntry(id);
+        if(c && c.entry != null) ui.drawString(c.entry, cx + 120, cy, 0xEF);
       }
-      ctx.fillStyle = '#aaa';
-      ctx.font = '7px monospace';
-      ctx.fillText('SPACE 出售   ESC 返回', W - 140, boxY + boxH - 6);
-      ctx.font = '8px monospace';
-      if(shop.msg){
-        ctx.fillStyle = '#0f0';
-        ctx.fillText(shop.msg, W - 120, boxY + 24);
+    }
+
+    // Quantity picker overlay.
+    if(shop.mode === 'buy-qty' || shop.mode === 'sell-qty'){
+      const id = buying ? shop.stock[shop.listIdx] : inv[shop.listIdx]?.id;
+      if(id != null){
+        const unit = buying ? itemTable[id].price : (itemTable[id].price >> 1);
+        ui.drawWindow(150, 120, 84, 24);
+        ui.drawString(0x28F, 158, 124, 0x2B);               // 數量
+        ui.drawNum(shop.qty, 200, 124, 1, {cells: 2, font: 'big'});
+        let x = ui.drawString(0x299, 8, 148, 0x2B);         // 總共是
+        x = ui.drawNum(unit * shop.qty, x + 2, 148, 1, {leftPack: true, font: 'big'});
+        ui.drawString(0x3BB, x + 2, 148, 0x2B);             // 元
       }
     }
   }
 
-  return {tryOpenShop, closeShop, tick, draw, getShop: () => shop};
+  return {openShop, openInn, closeShop, tick, draw, getShop: () => shop};
 }

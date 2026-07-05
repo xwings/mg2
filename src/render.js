@@ -5,11 +5,14 @@ import {
 
 export function createRenderer(ctx, res){
   const {playerFrames, npcFrames, doorAtlas, doorCol, stringTable,
-         itemTables = {}, tryByType = {}} = res;
-  // Per-kind item-name lookup mirroring main.js `lookupItemTable`. Used as a
-  // fallback when an inventory entry lost its cached glyphs (e.g. after a
-  // hot reload before save/load lands again).
+         itemTables = {}, tryByType = {}, itemTable = [], ui,
+         portraits = [], balloonFrames = [], skullImg = null} = res;
+  // Item-name lookup for entries without cached glyphs. P.15 at the raw
+  // item id is the original's only item-name source (renderer 0xA21);
+  // the kind cascade remains as a legacy fallback.
   function nameOf(id, kind){
+    const p15 = itemTables.potion && itemTables.potion[id];
+    if(p15) return p15;
     const tries = tryByType[kind === 2 ? 'equip' : 'basic'] || [];
     let fallback = null;
     for(const [src] of tries){
@@ -123,22 +126,21 @@ export function createRenderer(ctx, res){
     }
   }
 
-  function drawTreasures(state, treasureData){
+  // The original has NO treasure sprite — a chest is a map tile baked
+  // into the .MAP (opened chests are a tile rewrite, disasm 0x85DE), so
+  // renderScene already draws it. This debug-only overlay marks pickup
+  // spots when the ?triggers overlay is on.
+  function drawTreasures(state, treasureData, debug){
+    if(!debug) return;
     const list = treasureData[state.curArea];
     if(!list) return;
-    const now = performance.now();
     for(const t of list){
       if(t.collected) continue;
       if(t.x < state.cX || t.x >= state.cX + VCOLS) continue;
       if(t.y < state.cY || t.y >= state.cY + VROWS) continue;
       const sx = (t.x - state.cX) * TW, sy = (t.y - state.cY) * TH;
-      const pulse = Math.sin(now / 200) * 0.3 + 0.7;
-      ctx.fillStyle = `rgba(255,215,0,${pulse})`;
-      ctx.fillRect(sx + 2, sy + 1, 8, 8);
-      ctx.fillStyle = '#8B4513';
-      ctx.fillRect(sx + 3, sy + 2, 6, 6);
-      ctx.fillStyle = '#ffcc00';
-      ctx.fillRect(sx + 5, sy + 3, 2, 2);
+      ctx.strokeStyle = '#ff0';
+      ctx.strokeRect(sx + 0.5, sy + 0.5, TW - 1, TH - 1);
     }
   }
 
@@ -168,39 +170,18 @@ export function createRenderer(ctx, res){
     ctx.restore();
   }
 
+  // The original draws NO persistent overworld HUD (verified: frame
+  // pipeline 0x33A9 is map + sprites only — no HP/gold/minimap). Stats
+  // live in the ESC menu. This routine now only renders the debug
+  // trigger/minimap overlay when ?triggers is active.
   function drawHUD(state, areas, npcData, treasureData, showTriggers){
-    if(showTriggers) drawTriggerOverlay(state, areas);
-    ctx.fillStyle = 'rgba(0,0,0,0.75)';
-    ctx.fillRect(0, 0, W, 14);
-    ctx.fillStyle = '#f44';
-    ctx.fillRect(4, 4, (state.hp / state.maxHp) * 48, 6);
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(4, 4, 48, 6);
-    ctx.fillStyle = '#fff';
-    ctx.font = '7px monospace';
-    // MG2.15 entry 10 is the "HP" glyph (compact H+P). Use the real glyph
-    // when available so the label matches DOSBox; fall back to text.
-    const hpLabel = stringTable[10];
-    if(hpLabel){
-      // glyph is 16×15; HUD row is 14px tall. Draw at y=-1 and clip visually.
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(54, 0, 14, 12);
-      ctx.clip();
-      drawGlyph(hpLabel.subarray(0, 30), 54, -1);
-      ctx.restore();
-      ctx.fillText(state.hp + '/' + state.maxHp, 69, 10);
-    } else {
-      ctx.fillText('HP ' + state.hp + '/' + state.maxHp, 55, 10);
-    }
-    ctx.fillStyle = '#ff0';
-    ctx.fillText('$' + state.gold, 105, 10);
+    if(!showTriggers) return;
+    drawTriggerOverlay(state, areas);
     ctx.fillStyle = '#0f0';
+    ctx.font = '7px monospace';
     const mapName = areas[state.curArea] ? areas[state.curArea].map : '?';
-    ctx.fillText(mapName + ' (' + state.pX + ',' + state.pY + ')', 135, 10);
-    ctx.fillStyle = '#888';
-    ctx.fillText('SPACE:talk  ESC:menu', W - 110, 10);
+    ctx.fillText(mapName + ' (' + state.pX + ',' + state.pY + ')  $' + state.gold +
+                 '  HP ' + state.hp + '/' + state.maxHp, 4, 8);
 
     const mmX = W - 54, mmY = 16, mmSize = 50;
     ctx.fillStyle = 'rgba(0,0,0,0.7)';
@@ -219,55 +200,9 @@ export function createRenderer(ctx, res){
         }
       }
     }
-    if(areas[state.curArea]){
-      for(const t of areas[state.curArea].triggers){
-        if(t.sx === 0 || t.sy === 0) continue;
-        const mpx = (t.sx - state.pX + 25) * mmSize / 50, mpy = (t.sy - state.pY + 15) * mmSize / 30;
-        if(mpx >= 0 && mpx < mmSize && mpy >= 0 && mpy < mmSize){
-          ctx.fillStyle = '#f0f';
-          ctx.fillRect(mmX + mpx - 1, mmY + mpy - 1, 3, 3);
-        }
-      }
-    }
-    if(npcData[state.curArea]){
-      for(const n of npcData[state.curArea].npcs){
-        const mpx = (n.x - state.pX + 25) * mmSize / 50, mpy = (n.y - state.pY + 15) * mmSize / 30;
-        if(mpx >= 0 && mpx < mmSize && mpy >= 0 && mpy < mmSize){
-          ctx.fillStyle = '#ff0';
-          ctx.fillRect(mmX + mpx - 1, mmY + mpy - 1, 2, 2);
-        }
-      }
-    }
-    if(treasureData[state.curArea]){
-      for(const t of treasureData[state.curArea]){
-        if(t.collected) continue;
-        const mpx = (t.x - state.pX + 25) * mmSize / 50, mpy = (t.y - state.pY + 15) * mmSize / 30;
-        if(mpx >= 0 && mpx < mmSize && mpy >= 0 && mpy < mmSize){
-          ctx.fillStyle = '#fa0';
-          ctx.fillRect(mmX + mpx - 1, mmY + mpy - 1, 2, 2);
-        }
-      }
-    }
     ctx.fillStyle = '#fff';
     ctx.fillRect(mmX + mmSize / 2 - 1, mmY + mmSize / 2 - 1, 2, 2);
   }
-
-  // Item category color map. `source` values match main.js `TABLE_NAMES`:
-  //   item   (M.15)   — general items / spells
-  //   weapon (ATT.15) — weapons, armor
-  //   potion (P.15)   — potions / consumables
-  //   misc   (MG2.15) — fallback / UI-label-sourced names
-  //   script          — resolved by running a .15T entry
-  const SOURCE_COLORS = {
-    item:   '#9cf',   // cyan — items / spells
-    weapon: '#f96',   // orange — weapons / armor
-    potion: '#6f9',   // green — potions
-    misc:   '#ccc',   // gray — unresolved / generic
-    script: '#fc6',   // gold — from script run
-  };
-  const SOURCE_BADGES = {
-    item: 'itm', weapon: 'wpn', potion: 'pot', misc: '---', script: 'spc',
-  };
 
   // 30-byte 16×15 bitmap at 1:1. Downscaling Chinese glyphs merges strokes;
   // keep native size and use cell stride for breathing room instead.
@@ -281,46 +216,29 @@ export function createRenderer(ctx, res){
     }
   }
 
-  // Dialog layout matches DOSBox (disasm 0xABB). Lines at y=128/145/162/179.
-  const DLG_H = 78;
-  const DLG_LINES = [128, 145, 162, 179];
+  // Dialog window (disasm 0x8536/0x8b8d): (0,140) 320x60 via the 0xB503
+  // window primitive; 3 text lines at (10,145/162/179), 16-px glyph
+  // advance, white gradient (base 1). Next-page marker = MG2.15 entry
+  // 0x0F, fire color 0xEF, drawn right after the last glyph (no blink,
+  // disasm 0x8afe).
+  const DLG_LINES = [145, 162, 179];
   function drawScriptPage(page, speakerName, totalPages, pageIdx){
-    const boxY = H - DLG_H;
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, boxY, W, DLG_H);
-    ctx.strokeStyle = '#fff';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(0.5, boxY + 0.5, W - 1, DLG_H - 1);
-    // DOSBox renders cells at 17px stride (16px glyph + 1px gap). Without
-    // the gap Chinese strokes from adjacent characters touch and the line
-    // becomes unreadable.
-    const textX = 4;
-    const cw = 17;
-    const maxCols = Math.floor((W - 8) / cw);
-    for(let row = 0; row < Math.min(4, page.length); row++){
+    ui.drawWindow(0, 140, W, 60);
+    let lastX = 10, lastY = DLG_LINES[0];
+    for(let row = 0; row < Math.min(3, page.length); row++){
       const line = page[row];
+      let x = 10;
       const ly = DLG_LINES[row];
-      for(let col = 0; col < Math.min(line.length, maxCols); col++){
+      for(let col = 0; col < Math.min(line.length, 18); col++){
         const cell = line[col];
-        if(cell.space) continue;
-        drawGlyph(cell.glyph, textX + col * cw, ly);
+        if(!cell.space) ui.drawGlyphs(cell.glyph, x, ly, 1);
+        x += 16;
       }
+      if(line.length){ lastX = x; lastY = ly; }
     }
-    if(totalPages > 1){
-      ctx.fillStyle = '#888';
-      ctx.font = '7px monospace';
-      ctx.fillText((pageIdx + 1) + '/' + totalPages, 4, boxY - 2);
-    }
-    if(Math.floor(performance.now() / 400) % 2){
-      // MG2.15 entry 12 is the authentic ▼ "next page" indicator.
-      const arrow = stringTable[12];
-      if(arrow){
-        drawGlyph(arrow.subarray(0, 30), W - 18, H - 14);
-      } else {
-        ctx.fillStyle = '#ff0';
-        ctx.font = '9px monospace';
-        ctx.fillText('\u25BC', W - 10, H - 3);
-      }
+    if(pageIdx < totalPages - 1){
+      const marker = stringTable[0x0F];
+      if(marker && lastX <= W - 18) ui.drawGlyphs(marker.subarray(0, 30), lastX, lastY, 0xEF);
     }
   }
 
@@ -360,376 +278,273 @@ export function createRenderer(ctx, res){
     ctx.textAlign = 'left';
   }
 
-  function drawPickupMsg(msg, timer){
-    const alpha = Math.min(1, timer / 500);
-    let boxW = 140;
-    if(typeof msg === 'object' && msg.glyphs){
-      boxW = Math.max(140, 60 + (msg.glyphs.length / 30) * 17);
-    }
-    const boxX = (W - boxW) / 2;
-    ctx.fillStyle = `rgba(0,0,0,${alpha * 0.85})`;
-    ctx.fillRect(boxX, 28, boxW, 24);
-    ctx.strokeStyle = `rgba(255,215,0,${alpha})`;
-    ctx.strokeRect(boxX, 28, boxW, 24);
-    ctx.fillStyle = `rgba(255,255,0,${alpha})`;
+  // Pickup / gold / empty message — the original draws these in the
+  // standard dialog window at (0,140) 320×60 (disasm 0x8522/0x855B):
+  // "得到了" = MG2.15 entry 0x2C8 (color 0x2B) at (10,145), then the item
+  // name (P.15 glyphs, color 0xBB) or gold amount (color 0xBB) + "元"
+  // (entry 0x3BB, color 0x2B). Empty chest = entry 0x2BC, color 1.
+  function drawPickupMsg(msg){
+    ui.drawWindow(0, 140, W, 60);
     if(typeof msg === 'string'){
-      ctx.font = 'bold 10px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(msg, W/2, 44);
-      ctx.textAlign = 'left';
-    } else if(msg.type === 'gold'){
-      ctx.font = 'bold 11px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('+ ' + msg.amount + ' Gold', W/2, 44);
-      ctx.textAlign = 'left';
+      // Latin status strings (Saved / Exported / …) — not part of the
+      // original UI; render as plain text in the window.
+      ctx.fillStyle = ui.css(1);
+      ctx.font = '9px monospace';
+      ctx.fillText(msg, 10, 155);
+      return;
+    }
+    if(msg.type === 'gold'){
+      let x = ui.drawString(0x2C8, 10, 145, 0x2B);           // 得到了
+      x = ui.drawNum(msg.amount, x + 4, 145, 0xBB, {leftPack: true, font: 'big'});
+      ui.drawString(0x3BB, x + 2, 145, 0x2B);                // 元
     } else if(msg.type === 'item'){
-      const tint = SOURCE_COLORS[msg.source] || '#fff';
-      ctx.font = 'bold 10px sans-serif';
-      ctx.fillStyle = `rgba(255,255,255,${alpha})`;
-      ctx.fillText('Got', boxX + 6, 43);
-      if(msg.glyphs){
-        const nGlyphs = msg.glyphs.length / 30;
-        const startX = boxX + 36;
-        const startY = 33;
-        ctx.save();
-        ctx.globalAlpha = alpha;
-        for(let g = 0; g < nGlyphs; g++){
-          drawGlyph(msg.glyphs.subarray(g * 30, g * 30 + 30), startX + g * 17, startY, tint);
-        }
-        ctx.restore();
-      } else {
-        ctx.fillStyle = tint;
-        ctx.fillText('#' + msg.id, boxX + 40, 43);
-      }
-      // Category badge beside the glyphs so pickup type is obvious.
-      if(msg.source){
-        ctx.fillStyle = tint;
-        ctx.font = '7px monospace';
-        ctx.fillText('[' + (SOURCE_BADGES[msg.source] || msg.source) + ']', boxX + boxW - 30, 43);
-      }
+      const x = ui.drawString(0x2C8, 10, 145, 0x2B);
+      if(msg.glyphs) ui.drawGlyphs(msg.glyphs, x + 4, 145, 0xBB);
+      else ui.drawNum(msg.id, x + 4, 145, 0xBB, {leftPack: true, font: 'big'});
+    } else if(msg.type === 'empty'){
+      ui.drawString(0x2BC, 10, 145, 1);
     }
   }
 
-  // Helper: draw a string table entry's glyphs horizontally at (x, y).
-  function drawLabel(entryId, x, y){
-    const g = stringTable[entryId];
-    if(!g) return 0;
-    const n = g.length / 30;
-    for(let i = 0; i < n; i++) drawGlyph(g.subarray(i*30, i*30+30), x + i*17, y);
-    return n * 17;
+  // Helper: draw a string table entry's glyphs at (x, y) via the UI
+  // gradient painter; returns width used. `base` defaults to white.
+  function drawLabel(entryId, x, y, base = 1){
+    return ui.drawString(entryId, x, y, base) - x;
   }
 
-  // Menu categories aligned with MG2.15 entries 0/1/2 (物品/魔法/裝備).
-  // Order: Status, Items, Magic, Equipment, Save, Load, Close.
-  // `extra` = {focus, subIdx, msg} for interactive sub-panels.
+  // ── ESC menu (disasm 0x2e1c): a small window at (12,8) 100x70 with
+  // the six category labels (MG2.15 entries 0-5: 物品 魔法 裝備 狀態
+  // 進度 系統) in a 2x3 column-major grid at (25,15)/(25,35)/(25,55)
+  // and (70,15)/(70,35)/(70,55). Selection = fire-gradient color swap
+  // only (no cursor). Each category opens its own full window:
+  // item/spell browser (0,0) 306x150 (0x3e6c), status (0,10) 320x185
+  // (0x739b), equip 3-panel (0x6deb), 進度 chooser (40,60) 120x50
+  // (0xa0b4), 系統 quit confirm (80,85) 170x60 (0x303c).
+  const CAT_POS = [[25,15],[25,35],[25,55],[70,15],[70,35],[70,55]];
+
+  function drawCategories(gameMenu){
+    ui.drawWindow(12, 8, 100, 70);
+    for(let i = 0; i < 6; i++){
+      ui.drawString(i, CAT_POS[i][0], CAT_POS[i][1], i === gameMenu ? 0xEF : 1);
+    }
+  }
+
+  // Shared browser chrome (0x4525): main window (0,0) 306x150 + bottom
+  // message panel (0,149) 320x51; 7 rows x 2 cols from (30,8), column
+  // stride 140, row stride 20; highlight bar 102x20 at x=26/166,
+  // y=5+20*row with the hand at (barX-20, barY+5).
+  function drawBrowser(rows, cursor, msg){
+    ui.drawWindow(0, 0, 306, 150);
+    ui.drawWindow(0, 149, W, 51);
+    const first = Math.max(0, Math.min(cursor - 12, rows.length - 14));
+    for(let k = 0; k < Math.min(14, rows.length - first); k++){
+      const i = first + k;
+      const col = k % 2, row = (k / 2) | 0;
+      const x = 30 + col * 140, y = 8 + row * 20;
+      if(i === cursor){
+        ui.drawSelBar(26 + col * 140, 5 + row * 20);
+        ui.drawHand(6 + col * 140, 10 + row * 20);
+      }
+      rows[i](x, y, i === cursor);
+    }
+    if(msg){
+      ctx.fillStyle = ui.css(0xBA);
+      ctx.font = '8px monospace';
+      ctx.fillText(msg, 8, 162);
+    }
+  }
+
   function drawGameMenu(state, areas, inventory, gameMenu, magic, equipment, extra){
-    const mw = 240, mh = 180;
-    const mx = (W - mw) / 2, my = (H - mh) / 2;
-    ctx.fillStyle = 'rgba(0,0,0,0.92)';
-    ctx.fillRect(mx, my, mw, mh);
-    ctx.strokeStyle = '#ff0';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(mx, my, mw, mh);
-    ctx.fillStyle = '#ff0';
-    ctx.font = 'bold 11px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('MENU', mx + mw / 2, my + 14);
-    const items = [
-      {text: 'Status'},
-      {text: 'Items', glyph: 0},       // 物品
-      {text: 'Magic', glyph: 1},       // 魔法
-      {text: 'Equip', glyph: 2},       // 裝備
-      {text: 'Save'},
-      {text: 'Load'},
-      {text: 'Close'},
-    ];
-    ctx.font = '9px monospace';
-    ctx.textAlign = 'left';
-    for(let i = 0; i < items.length; i++){
-      const it = items[i];
-      const y = my + 28 + i * 14;
-      const x = mx + 12;
-      ctx.fillStyle = (i === gameMenu) ? '#ff0' : '#aaa';
-      ctx.fillText((i === gameMenu ? '> ' : '  ') + it.text, x, y + 8);
-      if(it.glyph != null){
-        ctx.save();
-        if(i !== gameMenu) ctx.globalAlpha = 0.5;
-        drawLabel(it.glyph, x + 60, y);
-        ctx.restore();
-      }
+    const focus = (extra && extra.focus) || 'categories';
+    const glyphsFor = extra?.itemGlyphs || ((id) => nameOf(id, 2));
+    const msg = extra?.msg || '';
+
+    if(focus === 'categories'){
+      drawCategories(gameMenu);
+      return;
     }
-    // Detail panel on the right half.
-    const dx = mx + mw / 2 + 4, dw = mw / 2 - 8, dy = my + 28, dh = mh - 36;
-    ctx.strokeStyle = '#666';
-    ctx.strokeRect(dx, dy, dw, dh);
-    ctx.fillStyle = '#fff';
-    ctx.font = '8px monospace';
-    if(gameMenu === 0){
-      // Full status view — mirrors DOSBox status2.png layout with every
-      // combat stat plus level, EXP, area, and adventure time.
-      ctx.fillStyle = '#ffe';
-      ctx.font = '8px monospace';
-      let yLine = dy + 4;
-      const hpG = stringTable[10], mpG = stringTable[11];
-      if(hpG) drawGlyph(hpG.subarray(0, 30), dx + 6, yLine);
-      else ctx.fillText('HP', dx + 6, yLine + 11);
-      ctx.fillText(': ' + state.hp + '/' + state.maxHp, dx + 26, yLine + 11);
-      yLine += 16;
-      if(mpG) drawGlyph(mpG.subarray(0, 30), dx + 6, yLine);
-      else ctx.fillText('MP', dx + 6, yLine + 11);
-      ctx.fillText(': ' + state.mp + '/' + state.maxMp, dx + 26, yLine + 11);
-      yLine += 16;
-      // Combat stats (compact grid — two columns).
-      const stats = [
-        ['Lv',  state.level ?? 1],
-        ['EXP', (state.exp ?? 0) + '/' + (state.level ?? 1) * 50],
-        ['ATK', state.atk ?? 0],
-        ['DEF', state.def ?? 0],
-        ['SPD', state.spd ?? 0],
-        ['mATK',state.mgAtk ?? 0],
-        ['mDEF',state.mgDef ?? 0],
-        ['$',   state.gold ?? 0],
-      ];
-      for(let i = 0; i < stats.length; i++){
-        const [lbl, v] = stats[i];
-        const col = i % 2, row = Math.floor(i / 2);
-        const sx = dx + 6 + col * 55, sy = yLine + row * 10;
-        ctx.fillStyle = '#ddd';
-        ctx.fillText(lbl.padEnd(4) + ' ' + v, sx, sy);
-      }
-      yLine += 4 * 10 + 4;
-      ctx.fillStyle = '#aaa';
-      ctx.fillText('Area: ' + (areas[state.curArea]?.map || '?'), dx + 6, yLine);
-      yLine += 10;
-      // Adventure time (h:mm:ss).
-      const secs = Math.floor((Date.now() - (state.playStart || Date.now())) / 1000);
-      const h = Math.floor(secs / 3600), m = Math.floor(secs / 60) % 60, s = secs % 60;
-      ctx.fillText('Time: ' + h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0'),
-                   dx + 6, yLine);
-    } else if(gameMenu === 1){
-      const focused = extra && extra.focus === 'items';
-      let y = dy + 10;
-      if(inventory.length === 0){
-        ctx.fillStyle = '#888';
-        ctx.fillText('(empty)', dx + 6, y + 8);
-      } else {
-        for(let i = 0; i < Math.min(6, inventory.length); i++){
-          const it = inventory[i];
-          const glyphs = it.glyphs || nameOf(it.id, it.kind);
-          const tint = SOURCE_COLORS[it.source] || '#fff';
-          const selected = focused && extra.subIdx === i;
-          // Cursor ▶ when the item sub-panel has focus.
-          if(selected){
-            ctx.fillStyle = '#ff0';
-            ctx.fillText('▶', dx - 1, y + 11);
-          }
-          if(glyphs){
-            const n = glyphs.length / 30;
-            for(let g = 0; g < n; g++){
-              drawGlyph(glyphs.subarray(g * 30, g * 30 + 30), dx + 10 + g * 17, y, selected ? '#ff0' : tint);
-            }
-            ctx.fillStyle = selected ? '#ff0' : '#ccc';
-            ctx.fillText('x' + it.count, dx + 10 + n * 17 + 2, y + 11);
-          } else {
-            // Shop-bought items have .shopName instead of glyphs.
-            ctx.fillStyle = selected ? '#ff0' : tint;
-            ctx.fillText((it.shopName || ('#' + it.id)) + ' x' + it.count, dx + 10, y + 11);
-          }
-          if(it.source){
-            ctx.fillStyle = selected ? '#ff0' : tint;
-            ctx.font = '7px monospace';
-            ctx.fillText(SOURCE_BADGES[it.source] || it.source, dx + dw - 22, y + 10);
-            ctx.font = '8px monospace';
-          }
-          y += 17;
-        }
-        // Footer hint + action message.
-        ctx.fillStyle = '#aaa';
-        ctx.font = '7px monospace';
-        if(focused){
-          ctx.fillText('SPACE 使用   ESC 返回', dx + 4, dy + dh - 14);
-          if(extra.msg){
-            ctx.fillStyle = '#0f0';
-            ctx.fillText(extra.msg, dx + 4, dy + dh - 4);
-          }
-        } else {
-          ctx.fillText('SPACE 開啟物品', dx + 4, dy + dh - 4);
-        }
-        ctx.font = '8px monospace';
-      }
-    } else if(gameMenu === 2){
-      const focused = extra && extra.focus === 'magic';
+
+    if(focus === 'items'){
+      const rows = inventory.map((it) => (x, y, sel) => {
+        const g = it.glyphs || glyphsFor(it.id);
+        const base = sel ? 0xEF : (it.id < 100 ? 0x71 : 0x78);
+        if(g) ui.drawGlyphs(g, x, y, base);
+        else ui.drawNum(it.id, x, y, base, {leftPack: true});
+        ui.drawString(0x3B6, x + 64, y, 0x8D);               // ：
+        ui.drawNum(it.count, x + 56, y + 5, 1, {cells: 5});
+      });
+      drawBrowser(rows, extra?.subIdx ?? 0, msg);
+      return;
+    }
+
+    if(focus === 'magic'){
       const spells = state.spells || [];
-      if(spells.length === 0){
-        ctx.fillStyle = '#888';
-        ctx.fillText('(no spells learned)', dx + 6, dy + 14);
-      } else {
-        let y = dy + 10;
-        for(let i = 0; i < Math.min(6, spells.length); i++){
-          const sp = spells[i];
-          const selected = focused && extra.subIdx === i;
-          if(selected){
-            ctx.fillStyle = '#ff0';
-            ctx.fillText('▶', dx - 1, y + 8);
-          }
-          // Highlight heal spells as usable from menu; damage spells only in battle.
-          const usableHere = sp.target === 'self' && sp.kind === 'heal';
-          ctx.fillStyle = selected ? '#ff0' : (usableHere ? '#cfc' : '#aaa');
-          ctx.fillText(sp.name + '  MP ' + sp.mpCost, dx + 10, y + 8);
-          y += 12;
-        }
-        ctx.fillStyle = '#aaa';
-        ctx.font = '7px monospace';
-        if(focused){
-          ctx.fillText('SPACE 使用   ESC 返回', dx + 4, dy + dh - 14);
-          if(extra.msg){
-            ctx.fillStyle = '#0f0';
-            ctx.fillText(extra.msg, dx + 4, dy + dh - 4);
-          }
-        } else {
-          ctx.fillText('SPACE 開啟魔法', dx + 4, dy + dh - 4);
-        }
-        ctx.font = '8px monospace';
-      }
-    } else if(gameMenu === 3){
-      // Equipment — three-step picker: member → slot → item.
-      const focus = (extra && extra.focus) || 'categories';
-      const party = state.party || [];
-      const mi = extra?.equipMember ?? 0;
-      const slot = extra?.equipSlot || 'weapon';
-      const itemSlotFn = extra?.itemSlot || (() => null);
-      const member = party[mi] || null;
-      const equipOf = (m, s) => (m && m.equipment && m.equipment[s]) || null;
-      const nameOfEquip = (eq) => eq ? (eq.shopName || '#' + eq.id) : '(無)';
-
-      let yLine = dy + 4;
-      // Always show the active party member and both slots at the top so
-      // the player sees what they're editing.
-      ctx.fillStyle = '#ffe'; ctx.font = 'bold 8px monospace';
-      ctx.fillText(member ? member.name : '?', dx + 4, yLine + 8);
-      yLine += 12;
-      ctx.font = '8px monospace';
-      for(const s of ['weapon', 'armor']){
-        const active = (focus === 'equip_slot' || focus === 'equip_pick') && slot === s;
-        ctx.fillStyle = active ? '#ff0' : '#ccc';
-        const label = s === 'weapon' ? '武器' : '防具';
-        const eq = equipOf(member, s);
-        ctx.fillText((active ? '▶ ' : '  ') + label + ': ' + nameOfEquip(eq), dx + 4, yLine + 8);
-        yLine += 11;
-      }
-      yLine += 4;
-
-      if(focus === 'equip_member'){
-        ctx.fillStyle = '#aaa'; ctx.font = '7px monospace';
-        ctx.fillText('選擇成員:', dx + 4, yLine + 6); yLine += 10;
-        ctx.font = '8px monospace';
-        for(let i = 0; i < party.length; i++){
-          const pm = party[i];
-          const sel = i === mi;
-          ctx.fillStyle = sel ? '#ff0' : '#ccc';
-          ctx.fillText((sel ? '▶ ' : '  ') + pm.name + ' Lv' + (pm.level || 1),
-                       dx + 4, yLine + 8);
-          yLine += 11;
-        }
-        ctx.fillStyle = '#aaa'; ctx.font = '7px monospace';
-        ctx.fillText('↑↓ 選擇  SPACE 確定  ESC 返回', dx + 2, dy + dh - 4);
-      } else if(focus === 'equip_pick'){
-        // Inventory filtered by slot type.
-        const matches = (inventory || [])
-          .map((it, i) => ({it, i}))
-          .filter(({it}) => itemSlotFn(it) === slot);
-        ctx.fillStyle = '#aaa'; ctx.font = '7px monospace';
-        ctx.fillText('選擇' + (slot === 'weapon' ? '武器' : '防具') + ':',
-                     dx + 4, yLine + 6);
-        yLine += 10;
-        ctx.font = '8px monospace';
-        if(matches.length === 0){
-          ctx.fillStyle = '#888';
-          ctx.fillText('(空)', dx + 4, yLine + 8);
-        } else {
-          const cursor = extra?.subIdx ?? 0;
-          const startAt = Math.max(0, Math.min(cursor - 2, matches.length - 5));
-          for(let k = 0; k < Math.min(5, matches.length - startAt); k++){
-            const idx = startAt + k;
-            const {it} = matches[idx];
-            const sel = idx === cursor;
-            const name = it.shopName || '#' + it.id;
-            const glyphs = it.glyphs || nameOf(it.id, it.kind);
-            ctx.fillStyle = sel ? '#ff0' : '#ccc';
-            ctx.fillText(sel ? '▶' : ' ', dx + 2, yLine + 8);
-            if(glyphs){
-              const n = Math.min(4, glyphs.length / 30 | 0);
-              for(let g = 0; g < n; g++){
-                drawGlyph(glyphs.subarray(g*30, g*30 + 30), dx + 10 + g*14, yLine, sel ? '#ff0' : '#ccc');
-              }
-              ctx.fillText('x' + it.count, dx + 10 + n*14 + 2, yLine + 8);
-            } else {
-              ctx.fillText(name + ' x' + it.count, dx + 10, yLine + 8);
-            }
-            yLine += 11;
-          }
-        }
-        ctx.fillStyle = '#aaa'; ctx.font = '7px monospace';
-        ctx.fillText('↑↓ 選擇  SPACE 裝備  ESC 返回', dx + 2, dy + dh - 4);
-      } else if(focus === 'equip_slot'){
-        ctx.fillStyle = '#aaa'; ctx.font = '7px monospace';
-        ctx.fillText('↑↓ 切換  SPACE 選物品  U 卸下  ESC 返回', dx + 2, dy + dh - 4);
-      } else {
-        // Not yet focused — show the hint.
-        ctx.fillStyle = '#aaa'; ctx.font = '7px monospace';
-        ctx.fillText('SPACE 開啟裝備', dx + 4, dy + dh - 4);
-      }
-      ctx.font = '8px monospace';
-      if(extra && extra.msg){
-        ctx.fillStyle = '#0f0'; ctx.font = '7px monospace';
-        ctx.fillText(extra.msg, dx + 4, dy + dh - 14);
-      }
+      const rows = spells.map((sp) => (x, y, sel) => {
+        const usable = sp.target === 'self' && sp.kind === 'heal';
+        const base = sel ? 0xEF : (usable ? 0x71 : 0x78);
+        const g = itemTables.magic && itemTables.magic[sp.id];
+        if(g) ui.drawGlyphs(g, x, y, base);
+        ui.drawString(0x3B6, x + 64, y, 0x8D);
+        ui.drawNum(sp.mpCost, x + 56, y + 5, 1, {cells: 5});
+      });
+      drawBrowser(rows, extra?.subIdx ?? 0, msg);
+      return;
     }
-    ctx.textAlign = 'left';
+
+    if(focus === 'status'){
+      // Full status screen (0x739b): window (0,10) 320x185, PBIG
+      // portrait, 體力/魔力 + level + five stats + 經驗 + equipment.
+      const mi = extra?.equipMember ?? 0;
+      const m = (state.party || [])[mi] || state;
+      ui.drawWindow(0, 10, 320, 185);
+      const portrait = portraits[mi];
+      if(portrait) ctx.drawImage(portrait, 0, 0);
+      ui.drawString(0x12C, 10, 20, 0x2B);                    // 體力
+      let x = ui.drawNum(m.hp, 40, 23, 1, {cells: 4});
+      ui.drawString(0x11, 80, 26, 1);                        // ／
+      ui.drawNum(m.maxHp, 96, 29, 0x64, {cells: 4});
+      ui.drawString(0x12D, 10, 40, 0x2B);                    // 魔力
+      ui.drawNum(m.mp, 40, 43, 1, {cells: 4});
+      ui.drawString(0x11, 80, 46, 1);
+      ui.drawNum(m.maxMp, 96, 49, 0x64, {cells: 4});
+      ui.drawString(0x12E, 210, 20, 0x7F);                   // 等級
+      ui.drawNum(m.level ?? 1, 242, 20, 0x48, {cells: 2, font: 'big'});
+      const LBL = [0x131, 0x132, 0x133, 0x134, 0x135];
+      const VAL = [m.atk, m.def, m.spd, m.mgAtk, m.mgDef];
+      for(let s = 0; s < 5; s++){
+        ui.drawString(LBL[s], 10, 60 + s * 20, 0x2B);
+        ui.drawNum(VAL[s] ?? 0, 48, 63 + s * 20, 1, {cells: 5});
+      }
+      ui.drawString(0x13C, 10, 165, 0x2B);                   // 經驗
+      ui.drawNum(m.exp ?? 0, 40, 168, 1, {cells: 8});
+      ui.drawString(0x14 + mi, 132, 150, 0xB9);              // name
+      // Equipped items (six slots) down the right side.
+      const SLOTS = ['weapon','shield','helmet','armor','acc1','acc2'];
+      for(let s = 0; s < 6; s++){
+        const id = m.equipment ? m.equipment[SLOTS[s]] : 0;
+        if(!id) continue;
+        const g = glyphsFor(id);
+        if(g) ui.drawGlyphs(g, 248, 50 + s * 20, 0x71);
+      }
+      // Adventure time (0x1E 冒險時間) bottom center.
+      const secs = Math.floor((Date.now() - (state.playStart || Date.now())) / 1000);
+      ui.drawString(0x1E, 128, 175, 0x2B);
+      let tx = ui.drawNum(Math.floor(secs / 3600), 196, 178, 1, {cells: 2});
+      tx = ui.drawString(0x13, tx + 2, 175, 1);
+      tx = ui.drawNum(Math.floor(secs / 60) % 60, tx + 2, 178, 1, {cells: 2});
+      tx = ui.drawString(0x13, tx + 2, 175, 1);
+      ui.drawNum(secs % 60, tx + 2, 178, 1, {cells: 2});
+      return;
+    }
+
+    if(focus === 'progress'){
+      // 進度 chooser (0xa0b4): 儲存目前進度 (0x190) / 讀取以前進度 (0x191).
+      drawCategories(gameMenu);
+      ui.drawWindow(40, 60, 200, 50);
+      ui.drawString(0x190, 50, 68, (extra?.subIdx ?? 0) === 0 ? 0xEF : 1);
+      ui.drawString(0x191, 50, 88, (extra?.subIdx ?? 0) === 1 ? 0xEF : 1);
+      return;
+    }
+
+    if(focus === 'system'){
+      // Quit confirm (0x303c): 0x19A text + 是/否.
+      drawCategories(gameMenu);
+      ui.drawWindow(80, 85, 170, 60);
+      ui.drawString(0x19A, 100, 93, 0xBC);
+      ui.drawString(0x384, 130, 120, 0xEF);                  // 是 (confirm = Space)
+      ui.drawString(0x385, 164, 120, 1);                     // 否 (ESC)
+      return;
+    }
+
+    if(focus === 'equip_pick' || focus === 'equip_slot'){
+      // Equip screen (0x6deb): stats panel (1,1) 156x73, slots panel
+      // (8,75) 140x125, inventory panel (160,5) 141x190 with 9 rows.
+      const SLOTS = ['weapon','shield','helmet','armor','acc1','acc2'];
+      const mi = extra?.equipMember ?? 0;
+      const slotIdx = extra?.equipSlotIdx ?? 0;
+      const m = (state.party || [])[mi];
+      ui.drawWindow(1, 1, 156, 73);
+      ui.drawWindow(8, 75, 140, 125);
+      ui.drawWindow(160, 5, 155, 190);
+      // Stats panel: 攻/防/速/魔攻/魔防 (0xE6-0xEA), values grad 0x48.
+      ui.drawString(0xE6, 10, 8, 1);  ui.drawNum(m?.atk ?? 0, 30, 12, 0x48, {cells: 3});
+      ui.drawString(0xE7, 10, 28, 1); ui.drawNum(m?.def ?? 0, 30, 32, 0x48, {cells: 3});
+      ui.drawString(0xE8, 10, 48, 1); ui.drawNum(m?.spd ?? 0, 30, 52, 0x48, {cells: 3});
+      ui.drawString(0xE9, 76, 18, 1); ui.drawNum(m?.mgAtk ?? 0, 112, 22, 0x48, {cells: 3});
+      ui.drawString(0xEA, 76, 38, 1); ui.drawNum(m?.mgDef ?? 0, 112, 42, 0x48, {cells: 3});
+      // Slots panel: labels 0xDC-0xE1 + equipped names.
+      for(let s = 0; s < 6; s++){
+        const y = 80 + s * 20;
+        const active = focus === 'equip_slot' && slotIdx === s;
+        ui.drawString(0xDC + s, 15, y, active ? 0xEF : 1);
+        const id = m ? m.equipment[SLOTS[s]] : 0;
+        if(id){
+          const g = glyphsFor(id);
+          if(g) ui.drawGlyphs(g, 63, y, active ? 0xEF : 0x2B);
+        }
+      }
+      // Inventory panel: 9 rows at (190, 13+20r); colors — consumables
+      // grey 0x78, equippable-by-member 0x71, else 0xAC (0x4b7c-0x4ba1).
+      const cursor = extra?.subIdx ?? 0;
+      const canWear = extra?.canWear || (() => false);
+      const first = Math.max(0, Math.min(cursor - 4, inventory.length - 9));
+      for(let k = 0; k < Math.min(9, inventory.length - first); k++){
+        const i = first + k;
+        const it = inventory[i];
+        const y = 13 + k * 20;
+        const sel = focus === 'equip_pick' && i === cursor;
+        if(sel){ ui.drawSelBar(187, 10 + k * 20); ui.drawHand(167, 15 + k * 20); }
+        const base = sel ? 0xEF
+          : it.id < 100 ? 0x78
+          : canWear(it.id, mi) ? 0x71 : 0xAC;
+        const g = it.glyphs || glyphsFor(it.id);
+        if(g) ui.drawGlyphs(g, 190, y, base);
+        ui.drawString(0x3B6, 254, y, 0x8D);
+        ui.drawNum(it.count, 246, y + 5, 1, {cells: 5});
+      }
+      if(msg){
+        ctx.fillStyle = ui.css(0xBA);
+        ctx.font = '8px monospace';
+        ctx.fillText(msg, 14, 196);
+      }
+      return;
+    }
   }
 
+  // Slot picker — save/load chooser window (disasm 0xa145 (140,40)
+  // 120×110). Kept our 5-slot metadata (map/HP/gold/date) since our save
+  // format is richer than the original's progress word.
   function drawSlotPicker(picker, slots, areas){
-    const mw = 260, mh = 160;
-    const mx = (W - mw) / 2, my = (H - mh) / 2;
-    // Dim anything behind the picker.
-    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
     ctx.fillRect(0, 0, W, H);
-    ctx.fillStyle = '#000';
-    ctx.fillRect(mx, my, mw, mh);
-    ctx.strokeStyle = '#ff0';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(mx, my, mw, mh);
-    ctx.fillStyle = '#ff0';
-    ctx.font = 'bold 11px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(picker.mode === 'save' ? 'SAVE TO SLOT' : 'LOAD SLOT', mx + mw / 2, my + 14);
-    ctx.font = '9px monospace';
-    ctx.textAlign = 'left';
+    const mw = 240, mh = 150, mx = (W - mw) / 2, my = (H - mh) / 2;
+    ui.drawWindow(mx, my, mw, mh);
+    ui.drawString(picker.mode === 'save' ? 0x190 : 0x191, mx + 12, my + 8, 0x2B);
     for(let i = 0; i < slots.length; i++){
       const meta = slots[i];
-      const y = my + 28 + i * 20;
-      ctx.fillStyle = (i === picker.index) ? '#ff0' : '#888';
-      const pfx = (i === picker.index) ? '> ' : '  ';
-      ctx.fillText(pfx + 'Slot ' + (i + 1), mx + 14, y + 10);
+      const y = my + 26 + i * 20;
+      const sel = i === picker.index;
+      if(sel) ui.drawHand(mx + 6, y + 1);
+      ui.drawString(0x3D5 + i, mx + 24, y, sel ? 0xEF : 1);    // slot digit glyph
       if(meta){
         const mapName = areas[meta.area]?.map || meta.map || '?';
-        const date = new Date(meta.time);
-        const dateStr = date.toLocaleDateString() + ' ' + date.toTimeString().slice(0, 5);
-        ctx.fillStyle = (i === picker.index) ? '#fff' : '#666';
-        ctx.fillText(mapName + '  HP ' + meta.hp + '/' + meta.maxHp + '  $' + meta.gold, mx + 70, y + 10);
-        ctx.fillStyle = (i === picker.index) ? '#aaa' : '#555';
+        ctx.fillStyle = ui.css(sel ? 0xEF : 1);
+        ctx.font = '8px monospace';
+        ctx.fillText(mapName, mx + 48, y + 8);
+        ui.drawString(0x12E, mx + 96, y, 0x2B);                // 等級
+        ui.drawNum(meta.hp ?? 0, mx + 136, y, 1, {cells: 4});
+        ctx.fillStyle = ui.css(0x2B);
         ctx.font = '7px monospace';
-        ctx.fillText(dateStr, mx + 70, y + 17);
-        ctx.font = '9px monospace';
+        const date = new Date(meta.time);
+        ctx.fillText(date.toLocaleDateString() + ' ' + date.toTimeString().slice(0,5), mx + 48, y + 16);
       } else {
-        ctx.fillStyle = (i === picker.index) ? '#888' : '#444';
-        ctx.fillText('(empty)', mx + 70, y + 10);
+        ui.drawString(0x2BC, mx + 48, y, 0x78);                // empty
       }
     }
-    ctx.fillStyle = '#888';
+    ctx.fillStyle = ui.css(0x2B);
     ctx.font = '7px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('↑↓ select  SPACE confirm  E export  I import  ESC cancel', mx + mw / 2, my + mh - 6);
+    ctx.fillText('SPACE / E export / I import / ESC', mx + mw/2, my + mh - 6);
     ctx.textAlign = 'left';
   }
 

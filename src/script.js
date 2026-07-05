@@ -19,7 +19,7 @@ export const OP_STRIDES = {
   0xFFB0: 0x0A,
   0xFFC0: 6, 0xFFD0: 6, 0xFFE0: 6, 0xFFF0: 6,
   // terminators (`ret`)
-  0xFF01: 4, 0xFF02: 4, 0xFF03: 4,  // [si+2] = next-page chain id (handled externally)
+  0xFF01: 4, 0xFF02: 22, 0xFF03: 22, // FF01: inn price; FF02/FF03: 10-slot shop stock
   0xFF09: 4,                         // jump to entry [si+2]
   0xFF10: 0x14,                      // 9 u16 params; reads up to [si+0x12]
   0xFFFF: 2,                         // chains to finalization at 0x92F7
@@ -136,13 +136,24 @@ export function runScript15T(script, idx){
     if(w >= 0xFF00){
       const stride = OP_STRIDES[w] || 2;
       if(w === 0xFF01 || w === 0xFF02 || w === 0xFF03){
-        // wait-for-input + chain (disasm 0x8B82/0x8BAC/0x8BD6 → call 0x985b/0x9b36/0x9d47 → ret).
-        // Each variant uses a different fade effect; param at [si+2] is the next entry id.
-        ops.push({op: w, pageIdx: pages.length, nextEntry: u16(body, i+2)});
+        // Shop terminators (disasm 0x8B82/0x8BAC/0x8BD6 → 0x985B inn /
+        // 0x9B36 item shop / 0x9D47 equip shop). FF01 carries the
+        // advertised room price at [si+2]; FF02/FF03 carry 10 stock item
+        // ids at [si+2..si+0x15], 0x3E7 (999) = empty slot (0x7750).
+        if(w === 0xFF01){
+          ops.push({op: w, pageIdx: pages.length, price: u16(body, i+2)});
+        } else {
+          const stock = [];
+          for(let s = 0; s < 10; s++){
+            const v = u16(body, i + 2 + s*2);
+            if(v !== 0x3E7) stock.push(v);
+          }
+          ops.push({op: w, pageIdx: pages.length, stock});
+        }
         flushPage();
         break;
       }
-      if(w === 0xFF08){ flushLine(); if(page.length >= 4) flushPage(); }
+      if(w === 0xFF08){ flushLine(); if(page.length >= 3) flushPage(); }
       else if(w === 0xFF09){
         // jump to entry [si+2] (disasm 0x8B64 → 0x88FE re-entry).
         ops.push({op: 0xFF09, pageIdx: pages.length, nextEntry: u16(body, i+2)});
@@ -183,11 +194,11 @@ export function runScript15T(script, idx){
         effects.push({type: ax === 0 ? 'pickup' : 'gold', value: dx});
         ops.push({op: 0xFF30, pageIdx: pages.length, kind: ax, value: dx});
       }
-      else if(w === 0xFF50){
-        ops.push({op: 0xFF50, pageIdx: pages.length, sound: u16(body, i+2)});
-      }
-      else if(w === 0xFF55){
-        ops.push({op: 0xFF55, pageIdx: pages.length, sound: u16(body, i+2)});
+      else if(w === 0xFF50 || w === 0xFF55){
+        // Set party-member count cs:0xb174 (disasm 0x8D7A / 0x8DAC —
+        // both write [si+2] there; FF50 additionally waits). Used by
+        // cutscenes when companions join/leave.
+        ops.push({op: w, pageIdx: pages.length, size: u16(body, i+2)});
       }
       else if(w === 0xFF60){
         // NPC teleport/init (disasm 0x8DC4). Stride 0x20, 5 u16 params:
@@ -221,10 +232,16 @@ export function runScript15T(script, idx){
         });
       }
       else if(w === 0xFF80){
-        // disasm 0x90DE: pushes ds/es/regs, calls 0x97DE with di=si+2 (string-table op),
-        // then `add si, 0xa`. Param block is 4 u16 values. Function not yet decoded.
+        // Map tile stamp (disasm 0x90DE → 0x97DE, shared with SJN's F1
+        // records). SIX BYTE params, not u16s: (mapY, mapX, tileRow,
+        // tileCol, w, h). Stamps a w×h rectangle of consecutive tileset
+        // indices (start = tileRow*25 + tileCol, 25-wide tileset grid)
+        // onto the map at (mapX, mapY); per tile, a nonzero .HEI attr
+        // routes the write to layer 2 (fs+0xFBE) instead of layer 1.
         ops.push({op: 0xFF80, pageIdx: pages.length,
-          p0: u16(body, i+2), p1: u16(body, i+4), p2: u16(body, i+6), p3: u16(body, i+8)});
+          mapY: body[i+2], mapX: body[i+3],
+          tileRow: body[i+4], tileCol: body[i+5],
+          w: body[i+6], h: body[i+7]});
       }
       else if(w === 0xFF90 || w === 0xFF91){
         // disasm 0x9101 / 0x9159: blit sprite at NPC [si+2]'s screen position.
@@ -242,20 +259,27 @@ export function runScript15T(script, idx){
         ops.push({op: 0xFFA2, pageIdx: pages.length, sound: u16(body, i+2)});
       }
       else if(w === 0xFFB0){
-        // disasm 0x9200: copy 8 bytes from [si+2..si+9] into ds:[0x3c69], then open
-        // file at ds:[0x3c65] via int 21h AH=3D. Loads a sub-script/data file.
-        // We capture the raw 8-byte filename for future support.
-        ops.push({op: 0xFFB0, pageIdx: pages.length,
-          name: body.subarray(i+2, i+10)});
+        // Show full-screen cutscene image (disasm 0x9200): the 8 bytes at
+        // [si+2..si+9] overwrite the name field of the `.\D\________.PBM`
+        // template at ds:0x3c65, then the PBM is loaded, PackBits-decoded
+        // (0x247A) and blitted. Names: PBIG01-04, POL01-20, GAMEOVER…
+        let pbm = '';
+        for(let b = 0; b < 8; b++){
+          const c = body[i+2+b];
+          if(c > 0x20 && c < 0x7F && c !== 0x5F) pbm += String.fromCharCode(c);
+          else break;
+        }
+        ops.push({op: 0xFFB0, pageIdx: pages.length, pbm});
       }
       else if(w === 0xFFC0){
         // disasm 0x925D: bx = [si+2] >> 1, then call 0x105ED (wait-ticks).
         ops.push({op: 0xFFC0, pageIdx: pages.length, ticks: u16(body, i+2)});
       }
       else if(w === 0xFFD0){
-        // disasm 0x9278: dx = [si+2], call 0x1665 (RNG?), dec [si+0x286], call 0x151c.
-        // Effect not yet decoded — capture param.
-        ops.push({op: 0xFFD0, pageIdx: pages.length, value: u16(body, i+2)});
+        // Remove one item [si+2] from the inventory (disasm 0x9278:
+        // 0x1665 finds the DS:0x284 slot, `dec [si+0x286]`, 0x151C
+        // compacts). Quest-item hand-ins.
+        ops.push({op: 0xFFD0, pageIdx: pages.length, itemId: u16(body, i+2)});
       }
       else if(w === 0xFFE0){
         // disasm 0x9298: re-render scene (call 0x33A9), copy framebuffer to A000:0,
@@ -264,8 +288,8 @@ export function runScript15T(script, idx){
         ops.push({op: 0xFFE0, pageIdx: pages.length, mode: u16(body, i+2)});
       }
       else if(w === 0xFFF0){
-        // disasm 0x92D3: call 0x9941 (snapshots player+NPC positions into history
-        // slots) + 10-tick wait via 0x10857. Used to register a state checkpoint.
+        // Full party heal (disasm 0x92D3 → 0x9941): per member record,
+        // HP←maxHP, MP←maxMP, status←0. Plus a 10-tick wait.
         ops.push({op: 0xFFF0, pageIdx: pages.length});
       }
       i += stride;
@@ -273,7 +297,7 @@ export function runScript15T(script, idx){
     } else if(w === 0xC000 || w === 0xC001){
       line.push({space: true});
       i += 2;
-      if(line.length >= 18){ flushLine(); if(page.length >= 4) flushPage(); }
+      if(line.length >= 18){ flushLine(); if(page.length >= 3) flushPage(); }
     } else {
       // Default string cell (disasm 0x89B0 → 0x8A75 → 0x8A95 `loop`):
       //   word at i  = glyph count N
@@ -292,7 +316,7 @@ export function runScript15T(script, idx){
       for(let g = 0; g < count; g++){
         line.push({glyph: body.subarray(i, i+30)});
         i += 30;
-        if(line.length >= 18){ flushLine(); if(page.length >= 4) flushPage(); }
+        if(line.length >= 18){ flushLine(); if(page.length >= 3) flushPage(); }
       }
     }
   }
@@ -363,6 +387,24 @@ export function applyScriptOps(ops, pageIdx, ctx){
           }
         }
       }
+    }
+    else if(o.op === 0xFF50 || o.op === 0xFF55){
+      // Party-member count (cs:0xb174). Companions aren't playable in the
+      // engine yet, so the host just records the value.
+      ctx.setPartySize?.(o.size);
+    }
+    else if(o.op === 0xFF80){
+      // Map tile stamp — write-through into the live map layers.
+      ctx.stampTiles?.(o);
+    }
+    else if(o.op === 0xFFB0){
+      ctx.showImage?.(o.pbm);
+    }
+    else if(o.op === 0xFFD0){
+      ctx.removeItem?.(o.itemId);
+    }
+    else if(o.op === 0xFFF0){
+      ctx.healParty?.();
     }
     else if(o.op === 0xFF10){
       // Conditional flag write: if party_state == cond, flags[flagIdx] = flagVal & 0xFF.

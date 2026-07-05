@@ -1,4 +1,5 @@
 import {W, H, DT, MCOLS, MROWS} from './constants.js';
+import {isConsumable, recomputeStats} from './items.js';
 
 // Per-area encounter table (MG2.EXE disasm 0x1aa6-0x1e53).
 //   biomeX = row index into encounterPool[1][biome] (group 1 = dungeons)
@@ -186,16 +187,26 @@ function makeExpForLevel(table){
   };
 }
 
-// Effect of using a consumable in battle. `source` comes from the .15
-// table that named the item (P.15=potion → HP heal, M.15=magic → MP
-// restore). Anything else (weapon / misc) is unusable in combat.
-function itemEffect(item){
-  if(item.source === 'potion') return {kind: 'heal', power: 25, target: 'self', label: 'HP'};
-  if(item.source === 'magic')  return {kind: 'mp',   power: 10, target: 'self', label: 'MP'};
-  return null;
-}
-
-export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyFrames, enemyStats, encounterPool, atsMap, levelExpTable){
+export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyFrames, enemyStats, encounterPool, atsMap, levelExpTable, itemTable, chrome = {}){
+  // Authentic battle chrome (see ARCHITECTURE/battle.md): battleUI is a
+  // VGA-palette UI toolkit, backdrop is the AM.TOS accessor, panel is
+  // SSLLP01 (320×50 command panel), attp are the 4×18 hero pose frames.
+  const bUI = chrome.ui;
+  const backdropOf = chrome.backdrop;
+  const panelImg = chrome.panel;
+  const attp = chrome.attp;
+  const itemTables = chrome.itemTables || {};
+  // Effect of using a consumable in battle — real item-table fields:
+  // stats[0] = HP restored, stats[1] = MP restored (disasm 0x534d).
+  // Equipment and zero-effect quest items are unusable in combat.
+  function itemEffect(item){
+    if(!isConsumable(item.id)) return null;
+    const rec = itemTable && itemTable[item.id];
+    if(!rec) return null;
+    if(rec.stats[0] > 0) return {kind: 'heal', power: rec.stats[0], target: 'self', label: 'HP'};
+    if(rec.stats[1] > 0) return {kind: 'mp',   power: rec.stats[1], target: 'self', label: 'MP'};
+    return null;
+  }
   const expForLevel = makeExpForLevel(levelExpTable);
   let encounterCounter = 30;
   let battle = null;
@@ -239,107 +250,58 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
     return (state.party || []).filter(m => m.hp > 0);
   }
 
+  // Enemy formation anchors (ATT.LOD 0xb524 table): bottom-center
+  // SCREEN offsets per party size, variant 0. Sprites grow up from the
+  // anchor; the whole formation is left-shifted so its leftmost edge
+  // sits at x=5.
+  const FORMATION = {
+    1: [[105,130]],
+    2: [[150,110],[70,145]],
+    3: [[170,85],[60,105],[125,145]],
+    4: [[170,80],[70,90],[155,135],[55,148]],
+    5: [[170,80],[65,90],[110,115],[160,140],[45,148]],
+  };
+
   function startBattle(tier, pick){
     const baseEnemy = pick?.enemy ?? 1;
-    const count = 1 + Math.floor(Math.random() * Math.min(3, tier + 1));
+    // Enemy count cap grows with the lead sprite size (ATT.LOD 0xb524);
+    // approximate with tier since we don't pre-measure here.
+    const count = 1 + Math.floor(Math.random() * Math.min(4, tier + 1));
+    const anchors = FORMATION[count] || FORMATION[5];
     const enemies = [];
-    // "Battle in the air": snapshot the overworld position, then teleport
-    // the hero to a FIXED battle stance — right of the viewport facing
-    // LEFT — so enemies always appear on the LEFT facing RIGHT regardless
-    // of where the encounter fired. `endBattle` restores the snapshot.
+    // Snapshot overworld position so endBattle can return to it. The
+    // battle now draws on a dedicated screen (backdrop + panel), so the
+    // player sprite is NOT teleported around the map anymore.
     const groundX = state.pX, groundY = state.pY, groundDir = state.pdir;
-    const mapRightEdge = 207, mapLeftEdge = 1;
-    const desiredPX = Math.min(mapRightEdge - 4, groundX + 3);
-    const battlePY = Math.max(10, Math.min(MROWS - 11, groundY));
-    state.pX = Math.max(mapLeftEdge + 12, desiredPX);
-    state.pY = battlePY;
-    state.pdir = 2;              // LEFT (0=UP 1=DOWN 2=LEFT 3=RIGHT)
-    const dx = -1;
-    const enemyFacing = 3;       // RIGHT (toward hero)
-    const BASE_DIST = 8;         // clears even a 150 px boss sprite
-    // Vertical formation offsets by group size (tiles from player row).
-    // Biased upward since the HUD hides the bottom ~4 tiles.
-    const V_OFFSETS = {
-      1: [ 0 ],
-      2: [ -3,  3 ],
-      3: [ -5,  0,  4 ],
-      4: [ -6, -2,  2,  5 ],
-    };
-    const vOff = V_OFFSETS[count] || V_OFFSETS[3];
-    // Odd-indexed slots step back 2 tiles so the formation becomes a
-    // shallow V instead of a column.
-    const depthOff = i => (i % 2 === 1 ? 2 : 0);
+    // Backdrop id = the AREA_ENEMY `enemy` field / outdoor biome map
+    // (cs:0xb1ed → AM.TOS record). Fall back to record 1.
+    const areaDef = AREA_ENEMY[state.curArea];
+    const backdropId = areaDef?.enemy ?? 1;
     for(let i = 0; i < count; i++){
-      // Every monster in the party is the area's fixed enemy. MG2.EXE
-      // writes a single `cs:[0xb1ed]` value per encounter; ATT.LOD fills
-      // its party table with that id repeated.
       const id = baseEnemy;
       const p = profileFor(id, enemyStats);
       const hp = Math.max(1, p.hp);
-      const lead = BASE_DIST + depthOff(i);
-      const vSpread = vOff[i] ?? 0;
-      let ex = state.pX + dx * lead;
-      let ey = state.pY + vSpread;
-      // Clamp so we never push an enemy off-map or into the panel area.
-      // The vertical clamp is tighter than the map edges: pY - 9 is the top
-      // of the visible viewport, and pY + 4 is the last row above the HUD.
-      if(ex < 1) ex = 1;
-      if(ex >= 207) ex = 206;
-      const minY = Math.max(1, state.pY - 9);
-      const maxY = Math.min(153, state.pY + 4);
-      if(ey < minY) ey = minY;
-      if(ey > maxY) ey = maxY;
+      const spr = enemyFrames && enemyFrames[p.sprite];
+      const w = spr?.w ?? 80, h = spr?.h ?? 70;
+      const [ax, ay] = anchors[i];
       enemies.push({
-        slot: i,
-        enemy: id,
-        sprite: p.sprite,
-        facing: enemyFacing,
-        name: p.name,
-        mapX: ex, mapY: ey,
-        hp, maxHp: hp,
-        atk: p.atk,
-        def: p.def,
-        expReward:  p.exp,
-        goldReward: p.gold,
-        alive: true,
-        flash: 0,
+        slot: i, enemy: id, sprite: p.sprite, name: p.name,
+        // Screen top-left = anchor − h − w/2 (bottom-center anchor).
+        sx: Math.round(ax - w / 2), sy: Math.round(ay - h),
+        w, h,
+        hp, maxHp: hp, atk: p.atk, def: p.def,
+        expReward: p.exp, goldReward: p.gold,
+        alive: true, flash: 0,
       });
     }
-    // De-overlap pass: ENEMY.TOS sprites vary 37×28 … 159×112 and can
-    // still collide after vertical clamping, so nudge overlappers 2
-    // tiles apart using their real bbox (fall back to 80×70 if a frame
-    // is missing). Sprites are bottom-center-anchored.
-    for(let i = 1; i < enemies.length; i++){
-      const a = enemies[i];
-      const aSpr = enemyFrames && enemyFrames[a.sprite];
-      const aW = aSpr?.w ?? 80, aH = aSpr?.h ?? 70;
-      // Nudging is vertical-only inside a ~13-tile clamp band, so a pair of
-      // tall sprites can overlap at every reachable Y. Cap the retries and
-      // accept the residual overlap (the original game overlaps formations
-      // too) — an uncapped rescan oscillates at the maxY clamp forever.
-      let tries = 0;
-      for(let j = 0; j < i && tries < 60; j++){
-        const b = enemies[j];
-        const bSpr = enemyFrames && enemyFrames[b.sprite];
-        const bW = bSpr?.w ?? 80, bH = bSpr?.h ?? 70;
-        const ax = a.mapX * 12 + 6 - aW / 2, ay = a.mapY * 10 + 10 - aH;
-        const bx = b.mapX * 12 + 6 - bW / 2, by = b.mapY * 10 + 10 - bH;
-        const overlap = ax < bx + bW && ax + aW > bx && ay < by + bH && ay + aH > by;
-        if(overlap){
-          const maxY = Math.min(153, state.pY + 4);
-          if(a.mapY < maxY) a.mapY += 2;
-          else a.mapY = Math.max(1, a.mapY - 2);
-          tries++;
-          j = -1;
-        }
-      }
-    }
+    // Left-shift the whole formation so nothing clips off the left edge.
+    let minX = Math.min(...enemies.map(e => e.sx));
+    if(minX < 5){ const d = 5 - minX; for(const e of enemies) e.sx += d; }
     battle = {
       tier,
       biomeX: pick?.biomeX ?? 0,
+      backdropId,
       enemies,
-      // Snapshot the overworld position + facing so endBattle can
-      // "return to ground" after the airborne fight.
       ground: {x: groundX, y: groundY, dir: groundDir},
       // UI mode machine:
       //   'intro'   — "敵人出現！" banner
@@ -365,11 +327,6 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
     // Reset per-member battle state.
     for(const m of state.party) m.defending = 0;
     state.state = state.ST.BATTLE;
-    // Camera snap — the player just teleported from the overworld
-    // position to the battle stance, and the cam is driven by state.cX/cY
-    // which were computed off the ground position. Recompute against the
-    // new pX/pY so the battle renders at the right 2/3 of the viewport.
-    if(state.updateCam) state.updateCam();
   }
 
   // Advance to the next selecting party member, OR enqueue enemy turns and
@@ -549,14 +506,25 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
     state.gold += gold;
     state.exp  += exp;
     let levelMsg = '';
-    while(state.exp >= expForLevel(state.level)){
-      state.exp -= expForLevel(state.level);
+    const hero = state.party[0];
+    // Roll the threshold ONCE per level (ATT.LOD 0x1c32 reads the rolled
+    // value it stored at +0x40) — calling expForLevel twice would compare
+    // against one jitter roll and subtract a different one.
+    let threshold = expForLevel(state.level);
+    while(state.exp >= threshold){
+      state.exp -= threshold;
       state.level++;
+      threshold = expForLevel(state.level);
       // Authentic growth — see STAT_GROWTH comment above for the ATT.LOD
-      // addresses this mirrors.
+      // addresses this mirrors. Combat-stat gains land on the BASE stats
+      // (member +0x20..+0x2A); effective stats are recomputed from base +
+      // equipment afterwards, exactly like the original (0x6fbb).
       for(const [key, base, rngBound] of STAT_GROWTH){
-        state[key] = (state[key] || 0) + base + rnd(rngBound);
+        const gain = base + rnd(rngBound);
+        if(key === 'maxHp' || key === 'maxMp') hero[key] += gain;
+        else hero.base[key] += gain;
       }
+      recomputeStats(hero, itemTable);
       // Level-up fully restores HP and MP (ATT.LOD doesn't snap current ←
       // max for atk/def/etc — only for HP and MP pairs at +0x00/+0x02 and
       // +0x04/+0x06).
@@ -606,16 +574,9 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
     return {kind: 'attack', target: tgt};
   }
 
-  // Teardown — restore the player to their pre-battle overworld position
-  // ("return to the ground") and clear the battle object. Called from
-  // every battle-exit path: victory, flee, defeat.
+  // Teardown — the battle runs on its own screen (backdrop + panel) and
+  // never moved the player, so there is nothing to restore.
   function endBattle(){
-    if(battle?.ground){
-      state.pX = battle.ground.x;
-      state.pY = battle.ground.y;
-      state.pdir = battle.ground.dir;
-      if(state.updateCam) state.updateCam();
-    }
     battle = null;
     state.state = state.ST.PLAY;
   }
@@ -726,10 +687,18 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
       return;
     }
 
+    // Grid navigation for the 2-column list window: ↑/↓ move rows (±2),
+    // ←/→ toggle columns (±1), clamped to the list bounds.
+    function gridNav(n){
+      if(pressedKey === 'ArrowUp'   && battle.sub - 2 >= 0) battle.sub -= 2;
+      if(pressedKey === 'ArrowDown' && battle.sub + 2 < n)  battle.sub += 2;
+      if(pressedKey === 'ArrowLeft' && (battle.sub & 1))    battle.sub -= 1;
+      if(pressedKey === 'ArrowRight' && !(battle.sub & 1) && battle.sub + 1 < n) battle.sub += 1;
+    }
+
     if(battle.mode === 'magic'){
       const m = activeMember();
-      if(pressedKey === 'ArrowUp')   battle.sub = (battle.sub + m.spells.length - 1) % m.spells.length;
-      if(pressedKey === 'ArrowDown') battle.sub = (battle.sub + 1) % m.spells.length;
+      gridNav(m.spells.length);
       if(pressedKey === 'Escape'){ battle.mode = 'select'; return; }
       if(pressedKey === 'Space' || pressedKey === 'Enter'){
         const sp = m.spells[battle.sub];
@@ -748,8 +717,7 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
     }
 
     if(battle.mode === 'item'){
-      if(pressedKey === 'ArrowUp')   battle.sub = (battle.sub + inv.length - 1) % inv.length;
-      if(pressedKey === 'ArrowDown') battle.sub = (battle.sub + 1) % inv.length;
+      gridNav(inv.length);
       if(pressedKey === 'Escape'){ battle.mode = 'select'; return; }
       if(pressedKey === 'Space' || pressedKey === 'Enter'){
         const it = inv[battle.sub];
@@ -765,188 +733,172 @@ export function createBattleSystem(state, areas, npcFrames, playerFrames, enemyF
   // Render
   // ──────────────────────────────────────────────────────────────────────
 
-  // Resolve the canvas for one enemy. Prefer ENEMY.TOS (variable-size monster
-  // sprites loaded by ATT.LOD CS:0xbc2a); fall back to POL001.TOS if a slot
-  // is missing or ENEMY.TOS didn't load.
-  function enemySpriteFor(e){
-    const idx = e.sprite ?? 0;
-    if(enemyFrames && enemyFrames[idx]) return enemyFrames[idx];
-    // POL001 fallback: wrap as {w, h, canvas} so callers use one interface.
-    if(npcFrames && npcFrames.length){
-      const FALLBACK_DIR = [0, 2, 4, 6];
-      const f = npcFrames[(idx * 8 + FALLBACK_DIR[e.facing ?? 1]) % npcFrames.length];
-      return f ? {w: 24, h: 24, canvas: f} : null;
-    }
-    return null;
+  // ── Dedicated battle screen (ATT.LOD composition) ──
+  // Draw order (ATT.LOD 0x185e): AM.TOS backdrop rows 0-149 → enemies
+  // (formation, bottom-center anchored) → SSLLP01 panel rows 150-199 →
+  // hero pose (ATTP) → command labels (ATT.15 1-6) → party status →
+  // target cursor → message. ATT.15 command labels: 物品/攻撃/魔法 (1-3)
+  // on the top row, 防禦/自動/逃跑 (4-6) below, at the panel's baked
+  // button positions (0x1867).
+  const CMD_ENTRY = [1, 2, 3, 4, 5, 6];
+  const CMD_POS = [[7,157],[48,157],[91,157],[7,180],[48,180],[91,180]];
+  // Engine menu index → ATT.15 command slot (0物品 1攻撃 2魔法 3防禦 4自動 5逃跑).
+  const MENU_TO_CMD = [0, 1, 2, 3, 4, 5];
+  // Party screen positions (ATT.LOD tables cs:[0x12d..], by party size):
+  // top-left of the 25×25 ATTP frame, right side of the screen.
+  const PARTY_POS = {
+    1: [[273,80]],
+    2: [[270,55],[276,102]],
+    3: [[270,50],[273,80],[276,110]],
+    4: [[270,45],[272,70],[274,95],[276,120]],
+  };
+
+  // ATTP pose frame for a member: 0 idle, 2 fallen, 11 defend.
+  function heroFrame(m){
+    if(m.hp <= 0) return 2;
+    if(m.defending > 0) return 11;
+    return 0;
   }
 
-  // Draw enemies on the area map at their world coords. Caller invokes this
-  // BETWEEN drawNPCs and drawPlayer so player+foreground still layer over.
-  // ENEMY.TOS sprites can be up to ~150×110 — bottom-center-anchor them so
-  // the monster stands on its map tile instead of floating above.
-  function drawBattleEnemies(ctx){
+  function drawScreen(ctx){
     if(!battle) return;
     ctx.imageSmoothingEnabled = false;
+
+    // Backdrop (rows 0-149). Fall back to a flat fill if AM.TOS is
+    // missing or the record is empty.
+    const bg = backdropOf ? backdropOf(battle.backdropId) : null;
+    if(bg) ctx.drawImage(bg, 0, 0);
+    else { ctx.fillStyle = '#101828'; ctx.fillRect(0, 0, W, 150); }
+
+    // Enemies at their fixed screen positions (bottom-center anchor
+    // already baked into e.sx/e.sy at startBattle).
     for(let i = 0; i < battle.enemies.length; i++){
       const e = battle.enemies[i];
       if(!e.alive) continue;
-      const cx = (e.mapX - state.cX) * 12;
-      const cy = (e.mapY - state.cY) * 10;
-      const spr = enemySpriteFor(e);
-      if(!spr){ ctx.fillStyle = '#a00'; ctx.fillRect(cx-6, cy-14, 24, 24); continue; }
-      // Anchor at bottom-center of the tile so tall monsters grow upward.
-      const dx = Math.round(cx + 6 - spr.w / 2);
-      const dy = Math.round(cy + 10 - spr.h);
-      if(dx < -spr.w || dx > W || dy < -spr.h || dy > H) continue;
-      ctx.drawImage(spr.canvas, dx, dy);
-      if(e.flash > 0){
-        ctx.fillStyle = `rgba(255,80,80,${Math.min(0.7, e.flash / 300)})`;
-        ctx.fillRect(dx, dy, spr.w, spr.h);
+      const spr = enemyFrames && enemyFrames[e.sprite];
+      if(spr){
+        ctx.drawImage(spr.canvas, e.sx, e.sy);
+        if(e.flash > 0){
+          ctx.fillStyle = `rgba(255,32,32,${Math.min(0.75, e.flash / 300)})`;
+          ctx.fillRect(e.sx, e.sy, e.w, e.h);
+        }
+      } else {
+        ctx.fillStyle = '#a00'; ctx.fillRect(e.sx, e.sy, e.w, e.h);
       }
-      // Stash the bounding box so HP bars / cursor render above the head.
-      e._screenX = dx; e._screenY = dy; e._screenW = spr.w; e._screenH = spr.h;
+      // Name + HP bar above the sprite.
+      const barW = Math.min(e.w, 48), barX = e.sx + (e.w - barW) / 2;
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(barX, e.sy - 5, barW, 3);
+      ctx.fillStyle = bUI ? bUI.css(0xBE) : '#d00';
+      ctx.fillRect(barX, e.sy - 5, barW * Math.max(0, e.hp) / e.maxHp, 3);
+      // Target cursor when this enemy is the current target — the
+      // LEFT-pointing hand (M_IP frame 1) at the enemy's right edge.
+      if(battle.mode === 'target' && battle.target === i && bUI){
+        bUI.drawHand(e.sx + e.w, e.sy + (e.h >> 1) - 8, 1);
+      }
     }
-  }
 
-  // HUD overlay — enemy HP bars + 6-command panel + party portrait/gauges.
-  // Called AFTER renderForeground so it sits on top.
-  function drawBattle(ctx){
-    if(!battle) return;
-
-    // Floating HP bar + target cursor above each living enemy, anchored to
-    // the actual drawn sprite (ENEMY.TOS frames vary 37×28 … 150×110).
-    ctx.textAlign = 'center';
-    for(let i = 0; i < battle.enemies.length; i++){
-      const e = battle.enemies[i];
-      if(!e.alive) continue;
-      const bx = e._screenX, by = e._screenY, bw = e._screenW;
-      if(bx == null || bx < -bw || bx > W) continue;
-      const barW = Math.min(bw, 48);
-      const barX = bx + (bw - barW) / 2;
-      ctx.fillStyle = 'rgba(0,0,0,0.7)';
-      ctx.fillRect(barX, by - 6, barW, 3);
-      ctx.fillStyle = '#f44';
-      ctx.fillRect(barX, by - 6, barW * Math.max(0, e.hp) / e.maxHp, 3);
-      ctx.fillStyle = '#fff';
-      ctx.font = '7px monospace';
-      ctx.fillText(e.name, bx + bw / 2, by - 8);
-      if(battle.mode === 'target' && battle.target === i){
-        ctx.fillStyle = '#ff0';
-        ctx.font = 'bold 10px monospace';
-        ctx.fillText('▼', bx + bw / 2, by - 14);
+    // Party battle sprites (ATTP poses) on the right of the screen.
+    const positions = PARTY_POS[state.party.length] || PARTY_POS[4];
+    for(let i = 0; i < state.party.length; i++){
+      const m = state.party[i];
+      const frames = attp && attp[m.sprite ?? i];
+      const pos = positions[i] || positions[positions.length - 1];
+      if(frames){
+        const f = frames[heroFrame(m)] || frames[0];
+        if(f) ctx.drawImage(f, pos[0], pos[1]);
       }
+    }
+
+    // Command panel (rows 150-199). SSLLP01 has the buttons baked in; if
+    // absent, draw the authentic window frame instead.
+    if(panelImg) ctx.drawImage(panelImg, 0, 150);
+    else if(bUI) bUI.drawWindow(0, 150, W, 50);
+
+    const active = activeMember();
+    // The command labels always sit on the panel's baked buttons; the
+    // magic/item submenus open a SEPARATE list window over the top of
+    // the screen (ATT.LOD 0x51d5: (0,0) 306×150, 2 cols × 7 rows at
+    // (30,8), stride 140/20, selection bar + hand) — they never draw
+    // into the command panel.
+    if(bUI){
+      for(let i = 0; i < 6; i++){
+        const [cx, cy] = CMD_POS[i];
+        const sel = battle.mode === 'select' && MENU_TO_CMD[battle.menu] === i;
+        bUI.drawString(CMD_ENTRY[i], cx, cy, sel ? 0xEF : 1);
+      }
+    }
+    if(bUI && (battle.mode === 'magic' || battle.mode === 'item')){
+      const magicMode = battle.mode === 'magic';
+      const list = magicMode ? (active.spells || []) : (inventory || []);
+      bUI.drawWindow(0, 0, 306, 150);
+      const first = Math.max(0, Math.min(battle.sub - 12, list.length - 14));
+      for(let k = 0; k < Math.min(14, list.length - first); k++){
+        const i = first + k;
+        const col = k % 2, row = (k / 2) | 0;
+        const x = 30 + col * 140, y = 8 + row * 20;
+        const sel = i === battle.sub;
+        if(sel){
+          bUI.drawSelBar(26 + col * 140, 5 + row * 20);
+          bUI.drawHand(6 + col * 140, 10 + row * 20);
+        }
+        if(magicMode){
+          const sp = list[i];
+          const g = itemTables.magic && itemTables.magic[sp.id];
+          const base = sel ? 0xEF : 0x71;
+          if(g) bUI.drawGlyphs(g, x, y, base);
+          bUI.drawNum(sp.mpCost, x + 56, y + 5, 1, {cells: 5});
+        } else {
+          const it = list[i];
+          const g = itemTables.potion && itemTables.potion[it.id];
+          const base = sel ? 0xEF : (itemEffect(it) ? 0x71 : 0x78);
+          if(g) bUI.drawGlyphs(g, x, y, base);
+          bUI.drawNum(it.count, x + 56, y + 5, 1, {cells: 5});
+        }
+      }
+    }
+
+    // Party status on the right of the panel (ATT.LOD 0x4e25): name,
+    // HP/MP labels (ATT.15 10/11) + digits + bars.
+    if(bUI){
+      const px = 200, py = 156;
+      bUI.drawString(0x14, px, py, 0xB9);                 // hero name
+      bUI.drawString(0x0A, px, py + 12, 0x49);            // HP
+      bUI.drawNum(active.hp, px + 20, py + 12, 1, {cells: 4});
+      bUI.drawString(0x0B, px + 60, py + 12, 0xE3);       // MP
+      bUI.drawNum(active.mp, px + 78, py + 12, 1, {cells: 3});
+      // HP/MP bars.
+      ctx.fillStyle = bUI.css(0x67); ctx.fillRect(px, py + 24, 100, 3);
+      ctx.fillStyle = bUI.css(0xBE);
+      ctx.fillRect(px, py + 24, 100 * Math.max(0, active.hp) / active.maxHp, 3);
+      ctx.fillStyle = bUI.css(0x67); ctx.fillRect(px, py + 30, 100, 3);
+      ctx.fillStyle = bUI.css(0xF6);
+      ctx.fillRect(px, py + 30, 100 * Math.max(0, active.mp) / Math.max(1, active.maxMp), 3);
+    }
+
+    // Enemy names (glyph would need ATT.15; use small text above each).
+    ctx.textAlign = 'center';
+    ctx.font = '7px monospace';
+    for(const e of battle.enemies){
+      if(!e.alive) continue;
+      ctx.fillStyle = '#fff';
+      ctx.fillText(e.name, e.sx + e.w / 2, e.sy - 7);
     }
     ctx.textAlign = 'left';
 
-    // ── Bottom 44-px wood-grain command panel (fight1.png reference) ──
-    const boxY = H - 44, boxH = 44;
-    ctx.fillStyle = '#2a1810';
-    ctx.fillRect(0, boxY, W, boxH);
-    ctx.fillStyle = '#5a3520';
-    ctx.fillRect(2, boxY + 2, W - 4, boxH - 4);
-    ctx.strokeStyle = '#1a0a05';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(0.5, boxY + 0.5, W - 1, boxH - 1);
-
-    // Left: 6-command grid (3 cols × 2 rows). Only shown during selection
-    // modes — submenu states replace the grid with a list.
-    const gridX = 6, gridY = boxY + 6;
-    const cellW = 48, cellH = 16;
-    const LABELS = ['物品', '攻擊', '魔法', '防禦', '自動', '逃跑'];
-    if(battle.mode === 'select' || battle.mode === 'target' ||
-       battle.mode === 'execute' || battle.mode === 'intro'){
-      for(let i = 0; i < 6; i++){
-        const col = i % 3, row = Math.floor(i / 3);
-        const cx = gridX + col * cellW, cy = gridY + row * cellH;
-        const sel = (battle.mode === 'select' && i === battle.menu);
-        ctx.fillStyle = sel ? '#664020' : '#3a2010';
-        ctx.fillRect(cx, cy, cellW - 2, cellH - 2);
-        ctx.strokeStyle = sel ? '#ffc040' : '#1a0a05';
-        ctx.strokeRect(cx + 0.5, cy + 0.5, cellW - 3, cellH - 3);
-        ctx.fillStyle = sel ? '#ff8' : '#ddc';
-        ctx.font = '9px monospace';
-        ctx.fillText(LABELS[i], cx + 6, cy + 11);
-      }
-    } else if(battle.mode === 'magic'){
-      const m = activeMember();
-      ctx.fillStyle = '#ff8';
-      ctx.font = '8px monospace';
-      ctx.fillText('魔法', 6, boxY + 12);
-      const visible = m.spells.slice(0, 4);
-      for(let i = 0; i < visible.length; i++){
-        const sp = visible[i];
-        const col = i % 2, row = Math.floor(i / 2);
-        const cx = 8 + col * 80, cy = boxY + 22 + row * 10;
-        ctx.fillStyle = i === battle.sub ? '#ff0' : '#ddc';
-        ctx.fillText((i === battle.sub ? '▶ ' : '  ') + sp.name + ' M' + sp.mpCost, cx, cy);
-      }
-    } else if(battle.mode === 'item'){
-      ctx.fillStyle = '#ff8';
-      ctx.font = '8px monospace';
-      ctx.fillText('物品', 6, boxY + 12);
-      const visible = inventory ? inventory.slice(0, 4) : [];
-      for(let i = 0; i < visible.length; i++){
-        const it = visible[i];
-        const eff = itemEffect(it);
-        const col = i % 2, row = Math.floor(i / 2);
-        const cx = 8 + col * 80, cy = boxY + 22 + row * 10;
-        ctx.fillStyle = i === battle.sub ? (eff ? '#ff0' : '#a55') : (eff ? '#ddc' : '#888');
-        const name = it.shopName || (it.source || '?').substr(0,3);
-        ctx.fillText((i === battle.sub ? '▶ ' : '  ') + name + ' x' + it.count, cx, cy);
-      }
-    }
-
-    // Right: party portrait + HP / MP gauge for the ACTIVE member.
-    const portraitX = W - 112;
-    const active = activeMember();
-    // Portrait box.
-    ctx.fillStyle = '#000';
-    ctx.fillRect(portraitX, boxY + 4, 28, 32);
-    if(playerFrames && playerFrames.length){
-      const pf = playerFrames[(active.sprite || 0) * 8 + 2];  // DOWN idle
-      if(pf){ ctx.imageSmoothingEnabled = false; ctx.drawImage(pf, portraitX + 2, boxY + 4); }
-    }
-    // HP / MP gauges.
-    const gx = portraitX + 34, gw = 72;
-    ctx.fillStyle = '#fff';
-    ctx.font = '8px monospace';
-    ctx.fillText(active.name, gx, boxY + 10);
-    // HP
-    ctx.fillStyle = '#400';
-    ctx.fillRect(gx, boxY + 13, gw, 5);
-    ctx.fillStyle = '#f44';
-    ctx.fillRect(gx, boxY + 13, gw * Math.max(0, active.hp) / active.maxHp, 5);
-    ctx.fillStyle = '#fff';
-    ctx.font = '7px monospace';
-    ctx.fillText('HP ' + active.hp, gx + gw + 2, boxY + 18);
-    // MP
-    ctx.fillStyle = '#004';
-    ctx.fillRect(gx, boxY + 21, gw, 5);
-    ctx.fillStyle = '#48f';
-    ctx.fillRect(gx, boxY + 21, gw * Math.max(0, active.mp) / Math.max(1, active.maxMp), 5);
-    ctx.fillText('MP ' + active.mp, gx + gw + 2, boxY + 26);
-    ctx.fillStyle = '#fc8';
-    ctx.fillText('$ ' + state.gold, gx, boxY + 34);
-    ctx.fillStyle = '#aaa';
-    ctx.fillText('Lv' + active.level + ' EXP ' + active.exp, gx + 34, boxY + 34);
-
-    // Status banner above the panel.
-    if(battle.msg){
+    // Message banner in the panel.
+    if(battle.msg && bUI){
+      ctx.fillStyle = bUI.css(0xBA);
       ctx.font = 'bold 9px sans-serif';
       ctx.textAlign = 'center';
-      const w = ctx.measureText(battle.msg).width + 20;
-      ctx.fillStyle = 'rgba(0,0,0,0.85)';
-      ctx.fillRect(W/2 - w/2, boxY - 14, w, 12);
-      ctx.fillStyle = '#ff0';
-      ctx.fillText(battle.msg, W/2, boxY - 5);
+      ctx.fillText(battle.msg, W / 2, 150 - 4);
       ctx.textAlign = 'left';
     }
   }
 
-
   return {
     tryEncounter, startBattle, battleTick,
-    drawBattle, drawBattleEnemies, setInventory,
+    drawScreen, setInventory,
     getBattle: () => battle,
     reset: () => { encounterCounter = 30; battle = null; },
   };

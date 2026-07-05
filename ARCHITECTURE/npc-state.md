@@ -1,17 +1,34 @@
-# NPC Quest-Blocker Engine (SJN.DAT)
+# NPC Quest-Blocker Engine (SJN.DAT) & Wander AI
 
 ## Goal
 
 Replay MG2's quest-blocker rules: flag-conditional NPC mutation (gate
-guards stepping aside, post-quest hides) plus the NPC
-visibility/position helpers the rest of the engine consults. Serves M1
-— without it, quest-gated passages stay blocked forever.
+guards stepping aside, post-quest hides), the NPC visibility/position
+helpers the rest of the engine consults, and the NPC wander AI. Serves
+M1 — without it, quest-gated passages stay blocked forever.
+
+## Wander AI (disasm 0x376C)
+
+`wanderTick()` (called by the boot loop every ~417 ms — the original's
+30-tick gate at 72 Hz):
+
+- Only NPCs with **mobility flag 1** (POL.DAT record +0x0E) move;
+  hidden / off-map (Y ≥ 160) NPCs skip; 50% act chance per tick.
+- A coin picks the axis; the NPC wanders around its **(x2, y2) anchor**
+  within **rangeY/rangeX** tiles (record +0x10/+0x12): at the limit
+  the step is forced back toward the anchor, otherwise 50/50 either way.
+- A step is blocked by map collision (both layers, both body columns),
+  other NPCs, and the player — but the NPC **turns to face the
+  attempted direction even when blocked** (0x3945 writes the facing
+  unconditionally).
 
 ## Status
 
-`done` for F0 (NPC-write) records — the complete SJN rule set is 46
-areas / 139 conditions. Non-F0 `rawTiles` map-tile rewrites are parsed
-but not applied (M3).
+`done` — F0 (NPC-write) records AND F1 map-tile rewrite records are
+both applied. F1 payloads are (mapY, mapX, tileRow, tileCol, w, h)
+blocks fed to the same tile-stamp routine as script opcode FF80 (disasm
+0x9726 → 0x97DE); `applySJN` stamps them via the `stampTiles` callback
+whenever the rule's area is the currently loaded map.
 
 ## Code Structure
 
@@ -21,7 +38,7 @@ but not applied (M3).
 
 ## Key Types and Entry Points
 
-- `src/npcState.js:29` - `createNpcState({state, areas, npcData, flags, sjnTable, MCOLS, MROWS})` - factory; returns `{applySJN, reapplySJN, npcPos, npcHidden}`.
+- `src/npcState.js:29` - `createNpcState({state, areas, npcData, flags, sjnTable, MCOLS, MROWS, stampTiles})` - factory; returns `{applySJN, reapplySJN, npcPos, npcHidden}`. `stampTiles` comes from `main.js` (shared with the FF80 opcode).
 - `src/npcState.js:30` - `applySJN(aid)` - walks SJN conditions for an area, writing NPC fields through the `NPC_FIELD` map (`:13`).
 - `src/npcState.js:49` - `reapplySJN()` - re-run for the current area; wired as dialog's `onPageOpsApplied` callback.
 - `src/npcState.js:61` - `npcHidden(n)` - three hide reasons: script `hidden` flag, unspawned script-bound NPC on a `0xF000` trigger tile, off-map sentinel.
@@ -59,6 +76,6 @@ python3 mg2tools.py sjn    # pass = decodes 46 areas / 139 conditions
 
 ## Open Gaps / Roadmap
 
-- **M3**: `rawTiles` map-tile rewrite records are carried through
-  parsing (`src/npcState.js:44`) but not applied — some quest events
-  that alter map tiles (not NPCs) won't visually change.
+- Tile stamps only apply to the currently loaded map; rules for other
+  areas re-stamp on the next `applySJN(aid)` at area entry (matching
+  the original, which re-runs the dispatcher on every area load).

@@ -1,14 +1,14 @@
 // Item-name resolution for inventory / pickup labels.
 //
-// MG2 ships four shared string tables (MG2.15, M.15, ATT.15, P.15) each
-// holding a different CATEGORY of names: UI labels, spells, weapons,
-// potions. The original engine swaps which file is mapped into EMS pages
-// 4-5 vs 6-7 depending on context (disasm 0xA21 vs 0xA6F).
+// The original renders EVERY item name from P.15 at the raw item id:
+// inventory draw 0x4b87, shop buy/sell 0x776f/0x79f0/0x4c19 all call the
+// P.15 glyph renderer (0xA21, EMS pages 4-5 filled from `.\D\P.15` by the
+// boot loader at 0xaaed) with bx = item id. M.15 holds spell names,
+// MG2.15 UI labels, ATT.15 battle strings — none of them item names.
 //
-// Our cascade: given a pickup's `kind` (from GEM.DAT flag2_hi), try each
-// table in priority order. First table with ≥ 2 glyphs wins. Equipment
-// pickups from `.15T` scripts (disasm 0x85A9 → 0x8840) fall back to the
-// area script's first page.
+// The old per-kind cascade (TRY_BY_TYPE) predates that finding; it's kept
+// only as a fallback for ids with no P.15 entry, then the area script's
+// first page (legacy path for odd pickups).
 
 import {runScript15T} from './script.js';
 
@@ -27,8 +27,11 @@ export function createItemNameResolver({tryByType, tables, getScript, getCurrent
     return out;
   }
 
-  // Returns {glyphs, source} or null. `kind` is 'basic' | 'equip' | 'magic'.
+  // Returns {glyphs, source} or null. P.15[id] is authoritative; the
+  // kind-based cascade only fills gaps.
   function lookupItemTable(itemId, kind){
+    const p15 = tables.potion && tables.potion[itemId];
+    if(p15) return {glyphs: p15, source: 'potion'};
     const tries = tryByType[kind] || tryByType.basic;
     let fallback = null, fallbackSrc = null;
     for(const [src] of tries){
